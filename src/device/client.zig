@@ -22,7 +22,7 @@ const Config = struct {
         const token = environ_map.get("ZSHELL_DEVICE_TOKEN") orelse return error.MissingDeviceToken;
         if (token.len < 24 or token.len > 512) return error.InvalidDeviceToken;
 
-        const device_name = environ_map.get("ZSHELL_DEVICE_NAME") orelse "shellcore";
+        const device_name = environ_map.get("ZSHELL_DEVICE_NAME") orelse return error.MissingDeviceName;
         if (device_name.len == 0 or device_name.len > 128) return error.InvalidDeviceName;
 
         const gateway = try parseGatewayAddress(gateway_text);
@@ -86,7 +86,7 @@ fn connectAndServe(
     var stream_reader = stream.reader(io, &read_buffer);
     var stream_writer = stream.writer(io, &write_buffer);
 
-    try sendHello(allocator, &stream_writer.interface, config);
+    try sendHello(allocator, io, &stream_writer.interface, config);
 
     const ack_text = try readFrame(allocator, &stream_reader.interface);
     defer allocator.free(ack_text);
@@ -312,11 +312,15 @@ fn joinAllCalls(slots: *[max_concurrent_calls]CallSlot) void {
 
 fn sendHello(
     allocator: std.mem.Allocator,
+    io: std.Io,
     writer: *std.Io.Writer,
     config: Config,
 ) !void {
     var payload: std.Io.Writer.Allocating = .init(allocator);
     defer payload.deinit();
+
+    const workspace = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(workspace);
 
     try payload.writer.print("{f}", .{std.json.fmt(.{
         .type = "hello",
@@ -324,6 +328,7 @@ fn sendHello(
         .token = config.token,
         .device = .{
             .name = config.device_name,
+            .workspace = workspace,
             .os = @tagName(builtin.os.tag),
             .arch = @tagName(builtin.cpu.arch),
             .version = version.value,

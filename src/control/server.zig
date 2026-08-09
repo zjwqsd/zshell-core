@@ -8,9 +8,27 @@ const shells = @import("../tools/shells.zig");
 const ports = @import("../runtime/ports.zig");
 const version = @import("../version.zig");
 
-pub const port: u16 = ports.human;
+pub const default_port: u16 = ports.human_start;
 const connection_buffer_size: usize = 16 * 1024;
 const dashboard_html = @embedFile("../web/index.html");
+
+const BoundControl = struct {
+    listener: std.Io.net.Server,
+    port: u16,
+};
+
+fn bindHumanControl(io: std.Io) !BoundControl {
+    var candidate = ports.human_start;
+    while (candidate <= ports.human_end) : (candidate += 1) {
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", candidate);
+        const listener = address.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => continue,
+            else => return err,
+        };
+        return .{ .listener = listener, .port = candidate };
+    }
+    return error.NoHumanControlPortAvailable;
+}
 
 const PublicJob = struct {
     jobId: u64,
@@ -30,15 +48,15 @@ const PublicShell = struct {
 };
 
 pub fn serve(allocator: std.mem.Allocator, io: std.Io) !void {
-    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
+    var bound = try bindHumanControl(io);
+    defer bound.listener.deinit(io);
+    const port = bound.port;
 
     std.log.info("zshell human control listening on http://127.0.0.1:{d}", .{port});
     events.record(io, .system, "control.server_started", .control, null, "human control plane listening");
 
     while (true) {
-        var stream = try listener.accept(io);
+        var stream = try bound.listener.accept(io);
         defer stream.close(io);
 
         var receive_buffer: [connection_buffer_size]u8 = undefined;
@@ -59,7 +77,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io) !void {
             else => return err,
         };
 
-        handleRequest(allocator, io, &request) catch |err| {
+        handleRequest(allocator, io, port, &request) catch |err| {
             std.log.err("human-control request failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -69,9 +87,10 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io) !void {
 fn handleRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
+    port: u16,
     request: *std.http.Server.Request,
 ) !void {
-    const origin = requestOriginStatus(request);
+    const origin = requestOriginStatus(request, port);
     if (origin == .denied or (request.head.method == .POST and origin != .allowed)) {
         return respondJsonValue(request, allocator, .forbidden, .{
             .@"error" = "HumanBrowserOriginRequired",
@@ -109,7 +128,7 @@ fn handleRequest(
 
     if (std.mem.eql(u8, target, "/api/state")) {
         if (request.head.method != .GET) return methodNotAllowed(request, allocator);
-        return respondState(allocator, io, request);
+        return respondState(allocator, io, port, request);
     }
 
     if (std.mem.eql(u8, target, "/api/control/take")) {
@@ -178,6 +197,7 @@ fn handleRequest(
 fn respondState(
     allocator: std.mem.Allocator,
     io: std.Io,
+    port: u16,
     request: *std.http.Server.Request,
 ) !void {
     const control_snapshot = control.snapshot(io);
@@ -315,7 +335,7 @@ fn parseActionId(target: []const u8, prefix: []const u8, suffix: []const u8) ?u6
 
 const OriginStatus = enum { none, allowed, denied };
 
-fn requestOriginStatus(request: *const std.http.Server.Request) OriginStatus {
+fn requestOriginStatus(request: *const std.http.Server.Request, port: u16) OriginStatus {
     var seen = false;
     var iterator = request.iterateHeaders();
     while (iterator.next()) |header| {
@@ -323,8 +343,12 @@ fn requestOriginStatus(request: *const std.http.Server.Request) OriginStatus {
         if (seen) return .denied;
         seen = true;
 
-        if (!std.mem.eql(u8, header.value, "http://127.0.0.1:8766") and
-            !std.mem.eql(u8, header.value, "http://localhost:8766"))
+        var origin_buffer: [64]u8 = undefined;
+        const loopback_origin = std.fmt.bufPrint(&origin_buffer, "http://127.0.0.1:{d}", .{port}) catch return .denied;
+        var localhost_buffer: [64]u8 = undefined;
+        const localhost_origin = std.fmt.bufPrint(&localhost_buffer, "http://localhost:{d}", .{port}) catch return .denied;
+        if (!std.mem.eql(u8, header.value, loopback_origin) and
+            !std.mem.eql(u8, header.value, localhost_origin))
         {
             return .denied;
         }
@@ -340,4 +364,17 @@ test "human control action path parser" {
     ));
     try std.testing.expect(parseActionId("/api/jobs/0/stop", "/api/jobs/", "/stop") == null);
     try std.testing.expect(parseActionId("/api/jobs/nope/stop", "/api/jobs/", "/stop") == null);
+}
+
+test "human control instances choose distinct local ports" {
+    const io = std.testing.io;
+
+    var first = try bindHumanControl(io);
+    defer first.listener.deinit(io);
+    var second = try bindHumanControl(io);
+    defer second.listener.deinit(io);
+
+    try std.testing.expect(first.port >= ports.human_start and first.port <= ports.human_end);
+    try std.testing.expect(second.port >= ports.human_start and second.port <= ports.human_end);
+    try std.testing.expect(first.port != second.port);
 }
