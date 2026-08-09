@@ -182,18 +182,20 @@ pub fn write(io: std.Io, input: WriteInput) !WriteResult {
     });
     defer file.close(io);
 
+    var final_size: u64 = undefined;
     if (input.append) {
         const before = try file.stat(io);
         try file.writePositionalAll(io, input.data, before.size);
+        final_size = before.size + @as(u64, @intCast(input.data.len));
     } else {
         try file.writePositionalAll(io, input.data, 0);
+        final_size = @as(u64, @intCast(input.data.len));
     }
 
-    const after = try file.stat(io);
     return .{
         .path = input.path,
         .bytes_written = input.data.len,
-        .size = after.size,
+        .size = final_size,
         .appended = input.append,
     };
 }
