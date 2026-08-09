@@ -42,8 +42,10 @@ pub fn write(
 pub fn read(
     allocator: std.mem.Allocator,
     shell_id: ShellId,
+    stdout_after: ?u64,
+    stderr_after: ?u64,
 ) !ReadResult {
-    return getManager().read(allocator, shell_id);
+    return getManager().read(allocator, shell_id, stdout_after, stderr_after);
 }
 
 pub fn kill(shell_id: ShellId) manager.LookupError!KillResult {

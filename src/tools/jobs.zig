@@ -33,8 +33,13 @@ pub fn status(job_id: JobId) manager.Error!StatusResult {
     return getManager().status(job_id);
 }
 
-pub fn logs(allocator: std.mem.Allocator, job_id: JobId) !LogsResult {
-    return getManager().logs(allocator, job_id);
+pub fn logs(
+    allocator: std.mem.Allocator,
+    job_id: JobId,
+    stdout_after: ?u64,
+    stderr_after: ?u64,
+) !LogsResult {
+    return getManager().logs(allocator, job_id, stdout_after, stderr_after);
 }
 
 pub fn stop(job_id: JobId) manager.Error!StatusResult {

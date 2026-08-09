@@ -6,12 +6,14 @@ pub const device = struct {
 
 pub const protocol = struct {
     pub const dispatcher = @import("protocol/dispatcher.zig");
+    pub const files = @import("protocol/files.zig");
     pub const output = @import("protocol/output.zig");
 };
 
 pub const tools = struct {
     pub const environment = @import("tools/environment.zig");
     pub const exec = @import("tools/exec.zig");
+    pub const filesystem = @import("tools/filesystem.zig");
     pub const jobs = @import("tools/jobs.zig");
     pub const shells = @import("tools/shells.zig");
 };

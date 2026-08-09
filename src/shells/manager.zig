@@ -52,6 +52,10 @@ pub const ReadResult = struct {
     stderr: []u8,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    stdout_start_offset: u64,
+    stderr_start_offset: u64,
+    stdout_next_offset: u64,
+    stderr_next_offset: u64,
     stdout_bytes: u64,
     stderr_bytes: u64,
 
@@ -319,6 +323,8 @@ pub const Manager = struct {
         self: *Manager,
         allocator: std.mem.Allocator,
         shell_id: ShellId,
+        stdout_after: ?u64,
+        stderr_after: ?u64,
     ) !ReadResult {
         const shell = try self.getShell(shell_id);
         reapFinishedThread(shell);
@@ -326,9 +332,12 @@ pub const Manager = struct {
         shell.mutex.lockUncancelable(shell.io);
         defer shell.mutex.unlock(shell.io);
 
-        const stdout_copy = try allocator.dupe(u8, shell.stdout.slice());
+        const stdout_range = try shell.stdout.readAfter(stdout_after);
+        const stderr_range = try shell.stderr.readAfter(stderr_after);
+
+        const stdout_copy = try allocator.dupe(u8, stdout_range.bytes);
         errdefer allocator.free(stdout_copy);
-        const stderr_copy = try allocator.dupe(u8, shell.stderr.slice());
+        const stderr_copy = try allocator.dupe(u8, stderr_range.bytes);
 
         return .{
             .shell_id = shell.id,
@@ -340,8 +349,12 @@ pub const Manager = struct {
             .termination_source = shell.termination_source,
             .stdout = stdout_copy,
             .stderr = stderr_copy,
-            .stdout_truncated = shell.stdout.truncated(),
-            .stderr_truncated = shell.stderr.truncated(),
+            .stdout_truncated = stdout_range.truncated,
+            .stderr_truncated = stderr_range.truncated,
+            .stdout_start_offset = stdout_range.start_offset,
+            .stderr_start_offset = stderr_range.start_offset,
+            .stdout_next_offset = stdout_range.next_offset,
+            .stderr_next_offset = stderr_range.next_offset,
             .stdout_bytes = shell.stdout.total_bytes,
             .stderr_bytes = shell.stderr.total_bytes,
         };
@@ -724,7 +737,6 @@ fn writeWindowsInput(
         "\n",
     );
 }
-
 
 fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {
     return switch (term) {

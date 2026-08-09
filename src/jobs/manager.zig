@@ -53,6 +53,10 @@ pub const LogsResult = struct {
     stderr: []u8,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    stdout_start_offset: u64,
+    stderr_start_offset: u64,
+    stdout_next_offset: u64,
+    stderr_next_offset: u64,
     stdout_bytes: u64,
     stderr_bytes: u64,
 
@@ -239,24 +243,33 @@ pub const Manager = struct {
         self: *Manager,
         allocator: std.mem.Allocator,
         job_id: JobId,
+        stdout_after: ?u64,
+        stderr_after: ?u64,
     ) !LogsResult {
         const job = try self.getJob(job_id);
 
         job.mutex.lockUncancelable(job.io);
         defer job.mutex.unlock(job.io);
 
-        // Copy under the lock so the HTTP response never aliases a buffer that
-        // the worker can mutate after the lock is released.
-        const stdout_copy = try allocator.dupe(u8, job.stdout.slice());
+        const stdout_range = try job.stdout.readAfter(stdout_after);
+        const stderr_range = try job.stderr.readAfter(stderr_after);
+
+        // Copy only the requested retained range while holding the lock so the
+        // response never aliases a tail buffer that the worker can mutate.
+        const stdout_copy = try allocator.dupe(u8, stdout_range.bytes);
         errdefer allocator.free(stdout_copy);
-        const stderr_copy = try allocator.dupe(u8, job.stderr.slice());
+        const stderr_copy = try allocator.dupe(u8, stderr_range.bytes);
 
         return .{
             .job_id = job.id,
             .stdout = stdout_copy,
             .stderr = stderr_copy,
-            .stdout_truncated = job.stdout.truncated(),
-            .stderr_truncated = job.stderr.truncated(),
+            .stdout_truncated = stdout_range.truncated,
+            .stderr_truncated = stderr_range.truncated,
+            .stdout_start_offset = stdout_range.start_offset,
+            .stderr_start_offset = stderr_range.start_offset,
+            .stdout_next_offset = stdout_range.next_offset,
+            .stderr_next_offset = stderr_range.next_offset,
             .stdout_bytes = job.stdout.total_bytes,
             .stderr_bytes = job.stderr.total_bytes,
         };

@@ -6,6 +6,7 @@ const environment = @import("../tools/environment.zig");
 const exec = @import("../tools/exec.zig");
 const executions = @import("../executions/manager.zig");
 const jobs = @import("../tools/jobs.zig");
+const file_operations = @import("files.zig");
 const shells = @import("../tools/shells.zig");
 const output = @import("output.zig");
 
@@ -24,6 +25,12 @@ const ShellWriteArguments = struct {
     shellId: u64,
     input: []const u8,
     enter: bool = true,
+};
+
+const StreamReadArguments = struct {
+    id: u64,
+    stdout_after: ?u64 = null,
+    stderr_after: ?u64 = null,
 };
 
 pub fn dispatch(
@@ -116,6 +123,18 @@ pub fn dispatch(
     if (std.mem.eql(u8, request.operation, "shell_list")) {
         return shellList(allocator, request.arguments, writer);
     }
+    if (try file_operations.dispatch(
+        allocator,
+        io,
+        request.operation,
+        request.arguments,
+        writer,
+    )) |file_outcome| {
+        return switch (file_outcome) {
+            .ok => .ok,
+            .bad_request => .bad_request,
+        };
+    }
 
     try writeFailure(writer, "OperationNotFound", "Unknown ShellCore operation");
     return .not_found;
@@ -127,7 +146,9 @@ fn isMutating(operation: []const u8) bool {
         std.mem.eql(u8, operation, "job_stop") or
         std.mem.eql(u8, operation, "shell_start") or
         std.mem.eql(u8, operation, "shell_write") or
-        std.mem.eql(u8, operation, "shell_kill");
+        std.mem.eql(u8, operation, "shell_kill") or
+        std.mem.eql(u8, operation, "file_write") or
+        std.mem.eql(u8, operation, "file_mkdir");
 }
 
 fn environmentInfo(
@@ -301,14 +322,23 @@ fn jobLogs(
     arguments: ?std.json.Value,
     writer: *std.Io.Writer,
 ) !Outcome {
-    const job_id = try parseIdArgument(arguments, "jobId", writer) orelse {
+    const input = try parseStreamReadArguments(arguments, "jobId", writer) orelse {
         return .bad_request;
     };
 
-    const result = jobs.logs(allocator, job_id) catch |err| switch (err) {
+    const result = jobs.logs(
+        allocator,
+        input.id,
+        input.stdout_after,
+        input.stderr_after,
+    ) catch |err| switch (err) {
         error.JobNotFound => {
             try writeFailure(writer, "JobNotFound", "Background job was not found");
             return .ok;
+        },
+        error.CursorAheadOfStream => {
+            try writeInvalidRequest(writer, "output cursor is ahead of the stream");
+            return .bad_request;
         },
         else => return err,
     };
@@ -325,12 +355,16 @@ fn jobLogs(
             .encoding = stdout.encoding,
             .data = stdout.data,
             .truncated = result.stdout_truncated,
+            .startOffset = result.stdout_start_offset,
+            .nextOffset = result.stdout_next_offset,
             .totalBytes = result.stdout_bytes,
         },
         .stderr = .{
             .encoding = stderr.encoding,
             .data = stderr.data,
             .truncated = result.stderr_truncated,
+            .startOffset = result.stderr_start_offset,
+            .nextOffset = result.stderr_next_offset,
             .totalBytes = result.stderr_bytes,
         },
     }, false);
@@ -416,14 +450,23 @@ fn shellRead(
     arguments: ?std.json.Value,
     writer: *std.Io.Writer,
 ) !Outcome {
-    const shell_id = try parseIdArgument(arguments, "shellId", writer) orelse {
+    const input = try parseStreamReadArguments(arguments, "shellId", writer) orelse {
         return .bad_request;
     };
 
-    const result = shells.read(allocator, shell_id) catch |err| switch (err) {
+    const result = shells.read(
+        allocator,
+        input.id,
+        input.stdout_after,
+        input.stderr_after,
+    ) catch |err| switch (err) {
         error.ShellNotFound => {
             try writeFailure(writer, "ShellNotFound", "Persistent shell was not found");
             return .ok;
+        },
+        error.CursorAheadOfStream => {
+            try writeInvalidRequest(writer, "output cursor is ahead of the stream");
+            return .bad_request;
         },
         else => return err,
     };
@@ -447,12 +490,16 @@ fn shellRead(
             .encoding = stdout.encoding,
             .data = stdout.data,
             .truncated = result.stdout_truncated,
+            .startOffset = result.stdout_start_offset,
+            .nextOffset = result.stdout_next_offset,
             .totalBytes = result.stdout_bytes,
         },
         .stderr = .{
             .encoding = stderr.encoding,
             .data = stderr.data,
             .truncated = result.stderr_truncated,
+            .startOffset = result.stderr_start_offset,
+            .nextOffset = result.stderr_next_offset,
             .totalBytes = result.stderr_bytes,
         },
     }, result.status == .failed);
@@ -669,6 +716,68 @@ fn parseShellWriteInput(
         },
         else => blk: {
             try writeInvalidRequest(writer, "arguments must be an object");
+            break :blk null;
+        },
+    };
+}
+
+fn parseStreamReadArguments(
+    arguments: ?std.json.Value,
+    comptime id_field: []const u8,
+    writer: *std.Io.Writer,
+) !?StreamReadArguments {
+    const value = arguments orelse {
+        try writeInvalidRequest(writer, id_field ++ " is required");
+        return null;
+    };
+
+    return switch (value) {
+        .object => |object| blk: {
+            if (!hasOnlyFields(object, &.{ id_field, "stdoutAfter", "stderrAfter" })) {
+                try writeInvalidRequest(writer, "Invalid stream read arguments");
+                break :blk null;
+            }
+
+            const id = getPositiveId(object, id_field) orelse {
+                try writeInvalidRequest(writer, id_field ++ " must be greater than zero");
+                break :blk null;
+            };
+
+            const stdout_after: ?u64 = if (object.get("stdoutAfter")) |cursor_value|
+                try parseCursorValue(cursor_value, writer) orelse break :blk null
+            else
+                null;
+            const stderr_after: ?u64 = if (object.get("stderrAfter")) |cursor_value|
+                try parseCursorValue(cursor_value, writer) orelse break :blk null
+            else
+                null;
+
+            break :blk StreamReadArguments{
+                .id = id,
+                .stdout_after = stdout_after,
+                .stderr_after = stderr_after,
+            };
+        },
+        else => blk: {
+            try writeInvalidRequest(writer, "arguments must be an object");
+            break :blk null;
+        },
+    };
+}
+
+fn parseCursorValue(
+    value: std.json.Value,
+    writer: *std.Io.Writer,
+) !?u64 {
+    return switch (value) {
+        .integer => |number| if (number >= 0)
+            @as(u64, @intCast(number))
+        else blk: {
+            try writeInvalidRequest(writer, "output cursor must be a non-negative integer");
+            break :blk null;
+        },
+        else => blk: {
+            try writeInvalidRequest(writer, "output cursor must be a non-negative integer");
             break :blk null;
         },
     };

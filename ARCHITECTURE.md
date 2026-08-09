@@ -13,7 +13,7 @@
 |                                                      |
 | device/client.zig       connection + reconnect       |
 | protocol/dispatcher.zig operation dispatch           |
-| tools/*                 exec / environment / jobs    |
+| tools/*                 exec / environment / jobs / files    |
 | shells/*                persistent shells            |
 | executions/*            execution tracking           |
 | control/*               local Human Control :8766    |
