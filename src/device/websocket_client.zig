@@ -70,6 +70,9 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        // The upgraded connection was detached from Request ownership but is still registered as used by Client.
+        self.connection.closing = true;
+        self.client.connection_pool.release(self.connection, self.io);
         self.client.deinit();
         self.allocator.destroy(self.client);
         self.* = undefined;

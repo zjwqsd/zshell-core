@@ -8,7 +8,6 @@ const websocket = @import("websocket_client.zig");
 
 const protocol_version: u32 = 2;
 const reconnect_delay_seconds: i64 = 2;
-const max_concurrent_calls: usize = 32;
 
 const Config = struct {
     gateway_url: []const u8,
@@ -112,15 +111,10 @@ fn connectAndServe(
     );
 
     var connection_writer = ConnectionWriter{
-        .io = io,
         .socket = &socket,
     };
-    var call_slots = [_]CallSlot{.{}} ** max_concurrent_calls;
-    defer joinAllCalls(&call_slots);
 
     while (true) {
-        reapFinishedCalls(&call_slots);
-
         const frame = try socket.readText();
         defer allocator.free(frame);
 
@@ -141,11 +135,6 @@ fn connectAndServe(
             return error.UnsupportedGatewayMessage;
         }
 
-        const slot = availableCallSlot(&call_slots) orelse {
-            try connection_writer.sendBusyResult(allocator, message.id);
-            continue;
-        };
-
         var request_writer: std.Io.Writer.Allocating = .init(allocator);
         defer request_writer.deinit();
         try request_writer.writer.print("{f}", .{std.json.fmt(.{
@@ -153,37 +142,27 @@ fn connectAndServe(
             .arguments = message.arguments,
         }, .{ .emit_null_optional_fields = false })});
 
-        const request = try request_writer.toOwnedSlice();
-        var request_owned = true;
-        errdefer if (request_owned) allocator.free(request);
-
-        slot.done.store(false, .release);
-        const thread = try std.Thread.spawn(
-            .{},
-            callWorkerMain,
-            .{CallWorkerContext{
-                .allocator = allocator,
-                .io = io,
-                .connection_writer = &connection_writer,
-                .request_id = message.id,
-                .request = request,
-                .done = &slot.done,
-            }},
+        var response_writer: std.Io.Writer.Allocating = .init(allocator);
+        defer response_writer.deinit();
+        _ = try dispatcher.dispatch(
+            allocator,
+            io,
+            request_writer.written(),
+            &response_writer.writer,
         );
-        request_owned = false;
-        slot.thread = thread;
+
+        try connection_writer.sendResult(
+            allocator,
+            message.id,
+            response_writer.written(),
+        );
     }
 }
 
 const ConnectionWriter = struct {
-    io: std.Io,
     socket: *websocket.Connection,
-    mutex: std.Io.Mutex = .init,
 
     fn sendPong(self: *ConnectionWriter, allocator: std.mem.Allocator, id: u64) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
         var payload: std.Io.Writer.Allocating = .init(allocator);
         defer payload.deinit();
         try payload.writer.print("{f}", .{std.json.fmt(.{ .type = "pong", .id = id }, .{})});
@@ -196,9 +175,6 @@ const ConnectionWriter = struct {
         id: u64,
         result: []const u8,
     ) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
         var payload: std.Io.Writer.Allocating = .init(allocator);
         defer payload.deinit();
         try payload.writer.writeAll("{\"type\":\"result\",\"id\":");
@@ -208,100 +184,7 @@ const ConnectionWriter = struct {
         try payload.writer.writeAll("}");
         try self.socket.writeText(payload.written());
     }
-
-    fn sendBusyResult(self: *ConnectionWriter, allocator: std.mem.Allocator, id: u64) !void {
-        var result: std.Io.Writer.Allocating = .init(allocator);
-        defer result.deinit();
-        try result.writer.print("{f}", .{std.json.fmt(.{
-            .ok = false,
-            .isError = true,
-            .@"error" = .{
-                .code = "TooManyConcurrentCalls",
-                .message = "ShellCore has too many concurrent calls",
-            },
-        }, .{})});
-        try self.sendResult(allocator, id, result.written());
-    }
 };
-
-const CallSlot = struct {
-    thread: ?std.Thread = null,
-    done: std.atomic.Value(bool) = .init(false),
-};
-
-const CallWorkerContext = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    connection_writer: *ConnectionWriter,
-    request_id: u64,
-    request: []u8,
-    done: *std.atomic.Value(bool),
-};
-
-fn callWorkerMain(context: CallWorkerContext) void {
-    defer context.done.store(true, .release);
-    defer context.allocator.free(context.request);
-
-    runCallWorker(context) catch |err| {
-        std.log.warn(
-            "ShellCore call {d} worker failed: {s}",
-            .{ context.request_id, @errorName(err) },
-        );
-        events.record(
-            context.io,
-            .system,
-            "shellcore.call_worker_failed",
-            .shellcore,
-            context.request_id,
-            @errorName(err),
-        );
-    };
-}
-
-fn runCallWorker(context: CallWorkerContext) !void {
-    var response_writer: std.Io.Writer.Allocating = .init(context.allocator);
-    defer response_writer.deinit();
-
-    _ = try dispatcher.dispatch(
-        context.allocator,
-        context.io,
-        context.request,
-        &response_writer.writer,
-    );
-
-    try context.connection_writer.sendResult(
-        context.allocator,
-        context.request_id,
-        response_writer.written(),
-    );
-}
-
-fn availableCallSlot(slots: *[max_concurrent_calls]CallSlot) ?*CallSlot {
-    reapFinishedCalls(slots);
-    for (slots) |*slot| {
-        if (slot.thread == null) return slot;
-    }
-    return null;
-}
-
-fn reapFinishedCalls(slots: *[max_concurrent_calls]CallSlot) void {
-    for (slots) |*slot| {
-        const thread = slot.thread orelse continue;
-        if (!slot.done.load(.acquire)) continue;
-        thread.join();
-        slot.thread = null;
-        slot.done.store(false, .release);
-    }
-}
-
-fn joinAllCalls(slots: *[max_concurrent_calls]CallSlot) void {
-    for (slots) |*slot| {
-        if (slot.thread) |thread| {
-            thread.join();
-            slot.thread = null;
-        }
-    }
-}
 
 fn sendHello(
     allocator: std.mem.Allocator,
