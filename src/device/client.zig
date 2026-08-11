@@ -4,9 +4,10 @@ const builtin = @import("builtin");
 const dispatcher = @import("../protocol/dispatcher.zig");
 const events = @import("../control/events.zig");
 const version = @import("../version.zig");
+const transfer = @import("transfer.zig");
 const websocket = @import("websocket_client.zig");
 
-const protocol_version: u32 = 2;
+const protocol_version: u32 = 3;
 const reconnect_delay_seconds: i64 = 2;
 
 const Config = struct {
@@ -113,15 +114,23 @@ fn connectAndServe(
     var connection_writer = ConnectionWriter{
         .socket = &socket,
     };
+    var transfers = transfer.Manager.init(allocator, io, &socket);
+    defer transfers.deinit();
 
     while (true) {
-        const frame = try socket.readText();
-        defer allocator.free(frame);
+        const frame = try socket.readMessage();
+        defer allocator.free(frame.payload);
+
+        if (frame.kind == .binary) {
+            try transfers.handleBinary(frame.payload);
+            continue;
+        }
+        if (try transfers.handleText(frame.payload)) continue;
 
         const parsed = try std.json.parseFromSlice(
             Incoming,
             allocator,
-            frame,
+            frame.payload,
             .{ .ignore_unknown_fields = false },
         );
         defer parsed.deinit();
