@@ -2,6 +2,9 @@ const std = @import("std");
 const zshell = @import("root.zig");
 
 pub fn main(init: std.process.Init) !void {
+    try zshell.tools.browser.init(init.gpa, init.io, init.environ_map);
+    defer zshell.tools.browser.deinit();
+
     zshell.tools.jobs.init(init.gpa, init.io);
     defer zshell.tools.jobs.deinit();
 

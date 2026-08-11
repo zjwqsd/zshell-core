@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const control = @import("../control/state.zig");
+const browser_operations = @import("browser.zig");
 const events = @import("../control/events.zig");
 const environment = @import("../tools/environment.zig");
 const exec = @import("../tools/exec.zig");
@@ -123,6 +124,18 @@ pub fn dispatch(
     if (std.mem.eql(u8, request.operation, "shell_list")) {
         return shellList(allocator, request.arguments, writer);
     }
+    if (try browser_operations.dispatch(
+        allocator,
+        request.operation,
+        request.arguments,
+        writer,
+    )) |browser_outcome| {
+        return switch (browser_outcome) {
+            .ok => .ok,
+            .bad_request => .bad_request,
+        };
+    }
+
     if (try file_operations.dispatch(
         allocator,
         io,
@@ -148,7 +161,20 @@ fn isMutating(operation: []const u8) bool {
         std.mem.eql(u8, operation, "shell_write") or
         std.mem.eql(u8, operation, "shell_kill") or
         std.mem.eql(u8, operation, "file_write") or
-        std.mem.eql(u8, operation, "file_mkdir");
+        std.mem.eql(u8, operation, "file_mkdir") or
+        std.mem.eql(u8, operation, "browser_start") or
+        std.mem.eql(u8, operation, "browser_open") or
+        std.mem.eql(u8, operation, "browser_click") or
+        std.mem.eql(u8, operation, "browser_fill") or
+        std.mem.eql(u8, operation, "browser_select") or
+        std.mem.eql(u8, operation, "browser_check") or
+        std.mem.eql(u8, operation, "browser_press") or
+        std.mem.eql(u8, operation, "browser_upload") or
+        std.mem.eql(u8, operation, "browser_download") or
+        std.mem.eql(u8, operation, "browser_tabs") or
+        std.mem.eql(u8, operation, "browser_screenshot") or
+        std.mem.eql(u8, operation, "browser_takeover") or
+        std.mem.eql(u8, operation, "browser_close");
 }
 
 fn environmentInfo(

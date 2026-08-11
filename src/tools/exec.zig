@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const secrets = @import("../runtime/secrets.zig");
+const process_tree = @import("../runtime/process_tree.zig");
 pub const Source = @import("../runtime/source.zig").Source;
 
 pub const default_timeout_ms: u64 = 60_000;
@@ -142,6 +143,7 @@ fn runProcess(
     var child = if (input.cwd) |cwd|
         try std.process.spawn(io, .{
             .argv = argv,
+            .pgid = process_tree.spawnProcessGroup(),
             .cwd = .{ .path = cwd },
             .stdin = .ignore,
             .stdout = .pipe,
@@ -150,6 +152,7 @@ fn runProcess(
     else
         try std.process.spawn(io, .{
             .argv = argv,
+            .pgid = process_tree.spawnProcessGroup(),
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .pipe,
@@ -157,7 +160,7 @@ fn runProcess(
 
     // After spawn, every error path must terminate the child.
     var child_finished = false;
-    defer if (!child_finished) child.kill(io);
+    defer if (!child_finished) process_tree.terminate(&child, io);
 
     // Read stdout and stderr together so neither pipe can fill and deadlock the
     // child while the parent waits on the other stream.
@@ -212,7 +215,7 @@ fn runProcess(
     try checkOutputLimits(stdout_reader, stderr_reader);
 
     if (did_timeout or cancelled_by != null) {
-        child.kill(io);
+        process_tree.terminate(&child, io);
         child_finished = true;
 
         try drainAfterTermination(
@@ -505,9 +508,9 @@ test "unicode output is UTF-8" {
 
     const command =
         switch (builtin.os.tag) {
-            .windows => "Write-Output '中文测试-你好-zshell'",
+            .windows => "Write-Output '娑擃厽鏋冨ù瀣槸-娴ｇ姴銈?zshell'",
 
-            else => "printf '中文测试-你好-zshell'",
+            else => "printf '娑擃厽鏋冨ù瀣槸-娴ｇ姴銈?zshell'",
         };
 
     const result =
@@ -536,7 +539,7 @@ test "unicode output is UTF-8" {
         std.mem.indexOf(
             u8,
             result.stdout,
-            "中文测试-你好-zshell",
+            "娑擃厽鏋冨ù瀣槸-娴ｇ姴銈?zshell",
         ) != null,
     );
 }
@@ -597,8 +600,7 @@ test "timeout terminates command" {
     );
 
     //
-    // Start-Sleep 5 秒，但应该明显早于 5 秒结束。
-    //
+    // Start-Sleep 5 缁夋帪绱濇担鍡楃安鐠囥儲妲戦弰鐐－娴?5 缁夋帞绮ㄩ弶鐔粹偓?    //
     try std.testing.expect(
         elapsed_ns <
             4 * std.time.ns_per_s,

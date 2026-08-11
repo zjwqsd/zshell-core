@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const secrets = @import("../runtime/secrets.zig");
+const process_tree = @import("../runtime/process_tree.zig");
 
 const TailBuffer = @import("../jobs/tail_buffer.zig").TailBuffer;
 const events = @import("../control/events.zig");
@@ -184,7 +185,7 @@ pub const Manager = struct {
 
         var child = try spawnPersistentShell(self.io, input.cwd);
         var child_owned = true;
-        errdefer if (child_owned) child.kill(self.io);
+        errdefer if (child_owned) process_tree.terminate(&child, self.io);
 
         const stdin = child.stdin.?;
         child.stdin = null;
@@ -444,8 +445,8 @@ fn runWorker(context: WorkerContext) !void {
     var child_active = true;
 
     defer if (child_active) {
+        process_tree.terminate(&child, io);
         closeInput(shell);
-        child.kill(io);
     };
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
@@ -471,8 +472,8 @@ fn runWorker(context: WorkerContext) !void {
         drainBuffered(shell, stdout_reader, stderr_reader);
 
         if (stopSource(shell)) |source| {
+            process_tree.terminate(&child, io);
             closeInput(shell);
-            child.kill(io);
             child_active = false;
             drainBuffered(shell, stdout_reader, stderr_reader);
             setKilled(shell, source);
@@ -657,6 +658,7 @@ fn spawnProcess(
             io,
             .{
                 .argv = argv,
+                .pgid = process_tree.spawnProcessGroup(),
 
                 .cwd = .{
                     .path = value,
@@ -673,6 +675,7 @@ fn spawnProcess(
         io,
         .{
             .argv = argv,
+            .pgid = process_tree.spawnProcessGroup(),
 
             .stdin = .pipe,
             .stdout = .pipe,
