@@ -31,6 +31,7 @@ pub const StartInput = struct {
 };
 
 pub const Status = struct {
+    enabled: bool,
     available: bool,
     active: bool,
     mode: ?[]const u8,
@@ -56,6 +57,7 @@ pub const CommandResult = struct {
 };
 
 pub const Error = error{
+    BrowserFeatureDisabled,
     BrowserUnavailable,
     BrowserAlreadyActive,
     BrowserNotActive,
@@ -69,6 +71,7 @@ pub const Error = error{
 
 const Manager = struct {
     allocator: std.mem.Allocator,
+    enabled: bool,
     io: std.Io,
     data_dir: []u8,
     child_environ: std.process.Environ.Map,
@@ -110,7 +113,8 @@ const Manager = struct {
 
     fn currentStatus(self: *const Manager) Status {
         return .{
-            .available = self.agent_browser_executable != null,
+            .enabled = self.enabled,
+            .available = self.enabled and self.agent_browser_executable != null and self.browser_executable != null,
             .active = self.active,
             .mode = if (self.active) self.mode.name() else null,
             .visible = self.active and self.visible,
@@ -123,6 +127,7 @@ const Manager = struct {
     }
 
     fn start(self: *Manager, allocator: std.mem.Allocator, input: StartInput) !CommandResult {
+        if (!self.enabled) return Error.BrowserFeatureDisabled;
         if (self.active) return Error.BrowserAlreadyActive;
         if (self.agent_browser_executable == null) return Error.BrowserUnavailable;
 
@@ -249,6 +254,7 @@ const Manager = struct {
     }
 
     fn requireAgent(self: *const Manager) Error!void {
+        if (!self.enabled) return Error.BrowserFeatureDisabled;
         if (!self.active) return Error.BrowserNotActive;
         if (self.owner == .human) return Error.BrowserHumanControlActive;
     }
@@ -269,6 +275,7 @@ const Manager = struct {
     }
 
     fn takeover(self: *Manager, owner: Owner) Error!Status {
+        if (!self.enabled) return Error.BrowserFeatureDisabled;
         if (!self.active) return Error.BrowserNotActive;
         if (owner == .human and !self.visible) return Error.BrowserMustBeVisible;
         self.owner = owner;
@@ -414,8 +421,29 @@ const InspectResult = struct {
 
 var global_manager: ?Manager = null;
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_map: anytype) !void {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_map: anytype, enabled: bool) !void {
     std.debug.assert(global_manager == null);
+
+    if (!enabled) {
+        global_manager = .{
+            .allocator = allocator,
+            .enabled = false,
+            .io = io,
+            .data_dir = try allocator.dupe(u8, ""),
+            .child_environ = std.process.Environ.Map.init(allocator),
+            .agent_browser_executable = null,
+            .browser_executable = null,
+        };
+        return;
+    }
+
+    const agent_browser_executable = try discoverAgentBrowserExecutable(allocator, io, environ_map) orelse
+        return error.AgentBrowserNotFound;
+    errdefer allocator.free(agent_browser_executable);
+
+    const browser_executable = try discoverBrowserExecutable(allocator, io, environ_map) orelse
+        return error.ChromeNotFound;
+    errdefer allocator.free(browser_executable);
 
     const data_dir = try resolveDataDir(allocator, environ_map);
     errdefer allocator.free(data_dir);
@@ -427,13 +455,9 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_map: anytype) !voi
     _ = child_environ.swapRemove("ZSHELL_OAUTH_ADMIN_PIN");
     _ = child_environ.swapRemove("ZSHELL_OAUTH_JWT_SECRET");
 
-    const agent_browser_executable = try discoverAgentBrowserExecutable(allocator, io, environ_map);
-    errdefer if (agent_browser_executable) |value| allocator.free(value);
-    const browser_executable = try discoverBrowserExecutable(allocator, io, environ_map);
-    errdefer if (browser_executable) |value| allocator.free(value);
-
     global_manager = .{
         .allocator = allocator,
+        .enabled = true,
         .io = io,
         .data_dir = data_dir,
         .child_environ = child_environ,
@@ -644,7 +668,7 @@ fn discoverAgentBrowserExecutable(
     environ_map: anytype,
 ) !?[]u8 {
     if (environ_map.get("ZSHELL_AGENT_BROWSER_EXECUTABLE")) |configured| {
-        if (configured.len == 0) return null;
+        if (configured.len == 0 or !pathExists(io, configured)) return null;
         return @as(?[]u8, try allocator.dupe(u8, configured));
     }
 
@@ -685,7 +709,7 @@ fn discoverBrowserExecutable(
     environ_map: anytype,
 ) !?[]u8 {
     if (environ_map.get("ZSHELL_BROWSER_EXECUTABLE")) |configured| {
-        if (configured.len == 0) return null;
+        if (configured.len == 0 or !pathExists(io, configured)) return null;
         return @as(?[]u8, try allocator.dupe(u8, configured));
     }
 
@@ -696,8 +720,6 @@ fn discoverBrowserExecutable(
             "google-chrome-stable",
             "chromium",
             "chromium-browser",
-            "microsoft-edge",
-            "microsoft-edge-stable",
         };
         var paths = std.mem.splitScalar(u8, path_value, ':');
         while (paths.next()) |directory| {
@@ -715,11 +737,9 @@ fn discoverBrowserExecutable(
 
     if (environ_map.get("PROGRAMFILES")) |base| {
         if (try candidateUnder(allocator, io, base, &.{ "Google", "Chrome", "Application", "chrome.exe" })) |path| return path;
-        if (try candidateUnder(allocator, io, base, &.{ "Microsoft", "Edge", "Application", "msedge.exe" })) |path| return path;
     }
     if (environ_map.get("PROGRAMFILES(X86)")) |base| {
         if (try candidateUnder(allocator, io, base, &.{ "Google", "Chrome", "Application", "chrome.exe" })) |path| return path;
-        if (try candidateUnder(allocator, io, base, &.{ "Microsoft", "Edge", "Application", "msedge.exe" })) |path| return path;
     }
     if (environ_map.get("LOCALAPPDATA")) |base| {
         if (try candidateUnder(allocator, io, base, &.{ "Google", "Chrome", "Application", "chrome.exe" })) |path| return path;
@@ -755,6 +775,7 @@ test "human takeover blocks agent until explicit return" {
 
     var manager = Manager{
         .allocator = allocator,
+        .enabled = true,
         .io = std.testing.io,
         .data_dir = data_dir,
         .child_environ = std.process.Environ.Map.init(allocator),
@@ -782,6 +803,7 @@ test "human takeover requires visible browser" {
 
     var manager = Manager{
         .allocator = allocator,
+        .enabled = true,
         .io = std.testing.io,
         .data_dir = data_dir,
         .child_environ = std.process.Environ.Map.init(allocator),
@@ -806,4 +828,27 @@ test "profile names reject path traversal" {
     try std.testing.expect(!isSafeProfileName("../default"));
     try std.testing.expect(!isSafeProfileName("school/profile"));
     try std.testing.expect(!isSafeProfileName(""));
+}
+
+test "disabled browser feature rejects browser operations" {
+    const allocator = std.testing.allocator;
+    const data_dir = try allocator.dupe(u8, "");
+    defer allocator.free(data_dir);
+
+    var manager = Manager{
+        .allocator = allocator,
+        .enabled = false,
+        .io = std.testing.io,
+        .data_dir = data_dir,
+        .child_environ = std.process.Environ.Map.init(allocator),
+        .agent_browser_executable = null,
+        .browser_executable = null,
+    };
+    defer manager.child_environ.deinit();
+
+    const status_value = manager.currentStatus();
+    try std.testing.expect(!status_value.enabled);
+    try std.testing.expect(!status_value.available);
+    try std.testing.expectError(Error.BrowserFeatureDisabled, manager.requireAgent());
+    try std.testing.expectError(Error.BrowserFeatureDisabled, manager.takeover(.agent));
 }

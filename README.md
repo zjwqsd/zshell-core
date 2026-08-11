@@ -15,6 +15,7 @@ ShellCore contains the operating-system execution capabilities and connects outb
 - connect outbound to `/device/ws`
 - declare its own device name and workspace
 - reconnect automatically after transport loss
+- optionally provide browser automation when started with `--browser`
 
 ## Connection configuration
 
@@ -63,6 +64,29 @@ $env:ZSHELL_DEVICE_NAME = "windows-laptop"
 ```
 
 If the gateway is unavailable, ShellCore remains running and retries every two seconds.
+
+## Optional browser capability
+
+Browser automation is opt-in. The default startup does not initialize, discover, or create browser state:
+
+```bash
+./zig-out/bin/zshell-core
+```
+
+Enable browser tools explicitly with:
+
+```bash
+./zig-out/bin/zshell-core --browser
+```
+
+When `--browser` is used, ShellCore performs startup preflight before connecting to Gateway. Both of these must be available:
+
+- `agent-browser` on `PATH`, or configured with `ZSHELL_AGENT_BROWSER_EXECUTABLE`
+- Google Chrome/Chromium, or configured with `ZSHELL_BROWSER_EXECUTABLE`
+
+If either dependency is missing, ShellCore exits instead of starting with a partially working browser subsystem. Without `--browser`, `browser_status` reports `enabled=false` and every other `browser_*` operation returns `BrowserFeatureDisabled`.
+
+`--no-browser` is also accepted for explicit browser-free startup. `--browser` and `--no-browser` cannot be combined.
 
 ## Transport
 

@@ -556,7 +556,8 @@ fn writeEngineResult(
 
 fn writeBrowserFailure(writer: *std.Io.Writer, err: anyerror) !void {
     const pair = switch (err) {
-        error.BrowserUnavailable => .{ "BrowserUnavailable", "agent-browser is not installed or its native executable could not be found" },
+        error.BrowserFeatureDisabled => .{ "BrowserFeatureDisabled", "Browser functionality was not enabled when this ShellCore started. Restart zshell-core with --browser to enable browser tools." },
+        error.BrowserUnavailable => .{ "BrowserUnavailable", "The browser runtime is unavailable" },
         error.BrowserAlreadyActive => .{ "BrowserAlreadyActive", "A zshell browser session is already active" },
         error.BrowserNotActive => .{ "BrowserNotActive", "No zshell browser session is active" },
         error.BrowserHumanControlActive => .{ "BrowserHumanControlActive", "The user currently owns browser control. Wait until the user explicitly returns control to the agent." },
