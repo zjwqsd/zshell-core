@@ -5,12 +5,6 @@ const WindowsApi = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn GetProcessId(process: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
 } else struct {};
 
-/// Spawn managed commands in their own process group on Linux so descendants
-/// can be terminated together with the direct child.
-pub fn spawnProcessGroup() ?std.posix.pid_t {
-    return if (builtin.os.tag == .linux) 0 else null;
-}
-
 /// Terminate a spawned command and the descendants that belong to its managed
 /// process tree/process group.
 pub fn terminate(child: *std.process.Child, io: std.Io) void {
@@ -57,8 +51,9 @@ fn terminateWindowsTree(child: *std.process.Child, io: std.Io) void {
 fn terminateLinuxGroup(child: *std.process.Child, io: std.Io) void {
     const pid = child.id orelse return;
 
-    // Managed Linux children are spawned with pgid=0, which makes the child the
-    // leader of a fresh process group. A negative PID addresses that whole group.
+    // Managed Linux children are launched through setsid, which makes the
+    // command the leader of a fresh session and process group. A negative PID
+    // addresses that whole group without sharing ShellCore's controlling TTY.
     std.posix.kill(-pid, .KILL) catch {};
 
     // Reap/clean up the direct child handle. This is also a fallback if the group

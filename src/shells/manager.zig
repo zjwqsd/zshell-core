@@ -584,6 +584,15 @@ fn spawnPersistentShell(
             cwd,
         ),
 
+        .linux => spawnProcess(
+            io,
+            &.{
+                "setsid",
+                "/bin/sh",
+            },
+            cwd,
+        ),
+
         else => spawnProcess(
             io,
             &.{
@@ -658,7 +667,6 @@ fn spawnProcess(
             io,
             .{
                 .argv = argv,
-                .pgid = process_tree.spawnProcessGroup(),
 
                 .cwd = .{
                     .path = value,
@@ -675,7 +683,6 @@ fn spawnProcess(
         io,
         .{
             .argv = argv,
-            .pgid = process_tree.spawnProcessGroup(),
 
             .stdin = .pipe,
             .stdout = .pipe,

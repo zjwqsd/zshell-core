@@ -318,14 +318,20 @@ const Manager = struct {
 
     fn ensureSessionAlive(self: *Manager, allocator: std.mem.Allocator) !void {
         // Verify the same browser process still exists before every Agent action.
-        // This prevents agent-browser auto-launch from silently replacing a lost
-        // session with a fresh empty browser whose refs and login context differ.
-        const info = try self.runSessionCommand(allocator, &.{ "session", "info" });
-        defer info.deinit(allocator);
-        if (!info.success or !sessionInfoHasBrowser(allocator, info.stdout)) {
-            self.clearSessionState();
-            return Error.BrowserSessionLost;
+        // agent-browser can report a successful launch slightly before its session
+        // daemon/socket is observable, so tolerate that short startup race.
+        const retry_delays_ms = [_]i64{ 0, 100, 250, 500 };
+        for (retry_delays_ms) |delay_ms| {
+            if (delay_ms != 0) try self.io.sleep(.fromMilliseconds(delay_ms), .awake);
+
+            const info = try self.runSessionCommand(allocator, &.{ "session", "info" });
+            const alive = info.success and sessionInfoHasBrowser(allocator, info.stdout);
+            info.deinit(allocator);
+            if (alive) return;
         }
+
+        self.clearSessionState();
+        return Error.BrowserSessionLost;
     }
 
     fn runSessionCommand(
@@ -681,6 +687,28 @@ fn discoverBrowserExecutable(
     if (environ_map.get("ZSHELL_BROWSER_EXECUTABLE")) |configured| {
         if (configured.len == 0) return null;
         return @as(?[]u8, try allocator.dupe(u8, configured));
+    }
+
+    if (builtin.os.tag == .linux) {
+        const path_value = environ_map.get("PATH") orelse return null;
+        const names = [_][]const u8{
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+        };
+        var paths = std.mem.splitScalar(u8, path_value, ':');
+        while (paths.next()) |directory| {
+            if (directory.len == 0) continue;
+            for (names) |name| {
+                const candidate = try std.fs.path.join(allocator, &.{ directory, name });
+                if (pathExists(io, candidate)) return candidate;
+                allocator.free(candidate);
+            }
+        }
+        return null;
     }
 
     if (builtin.os.tag != .windows) return null;

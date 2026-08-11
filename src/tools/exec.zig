@@ -116,6 +116,20 @@ fn runShell(
                 cancellation,
             );
         },
+        .linux => blk: {
+            var command_writer: std.Io.Writer.Allocating = .init(allocator);
+            defer command_writer.deinit();
+            try command_writer.writer.writeAll(secrets.posix_clear);
+            try command_writer.writer.writeAll(input.command);
+
+            break :blk try runProcess(
+                allocator,
+                io,
+                &.{ "setsid", "/bin/sh", "-c", command_writer.written() },
+                input,
+                cancellation,
+            );
+        },
         else => blk: {
             var command_writer: std.Io.Writer.Allocating = .init(allocator);
             defer command_writer.deinit();
@@ -143,7 +157,6 @@ fn runProcess(
     var child = if (input.cwd) |cwd|
         try std.process.spawn(io, .{
             .argv = argv,
-            .pgid = process_tree.spawnProcessGroup(),
             .cwd = .{ .path = cwd },
             .stdin = .ignore,
             .stdout = .pipe,
@@ -152,7 +165,6 @@ fn runProcess(
     else
         try std.process.spawn(io, .{
             .argv = argv,
-            .pgid = process_tree.spawnProcessGroup(),
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .pipe,
