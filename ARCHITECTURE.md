@@ -16,8 +16,8 @@
 | device/websocket_client.zig  WebSocket + TLS transport |
 | protocol/dispatcher.zig      operation dispatch        |
 | tools/*                      exec / env / files        |
-| jobs/*                       background jobs           |
-| shells/*                     persistent shells         |
+| jobs/*                       direct background jobs    |
+| shells/*                     PTY / ConPTY terminals    |
 | control/*                    local Human Control       |
 +--------------------------------------------------------+
 ```
@@ -32,7 +32,7 @@ Every Core instance requires `ZSHELL_DEVICE_NAME`. The name is the gateway routi
 
 ## Lifecycle
 
-1. initialize jobs and persistent-shell managers
+1. initialize job and interactive-terminal managers
 2. bind Human Control to the first free loopback port in `8766..8799`
 3. read `ZSHELL_GATEWAY_URL`, `ZSHELL_DEVICE_TOKEN` and `ZSHELL_DEVICE_NAME`
 4. open a WebSocket to `/device/ws`

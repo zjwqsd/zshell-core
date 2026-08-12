@@ -12,6 +12,7 @@ pub const cancel_poll_interval_ms: u64 = 100;
 
 pub const shell_name = switch (builtin.os.tag) {
     .windows => "powershell.exe",
+    .linux => "/bin/bash",
     else => "/bin/sh",
 };
 
@@ -125,7 +126,7 @@ fn runShell(
             break :blk try runProcess(
                 allocator,
                 io,
-                &.{ "setsid", "/bin/sh", "-c", command_writer.written() },
+                &.{ "/bin/bash", "-c", command_writer.written() },
                 input,
                 cancellation,
             );
@@ -154,21 +155,17 @@ fn runProcess(
     input: Input,
     cancellation: ?Cancellation,
 ) !Result {
-    var child = if (input.cwd) |cwd|
-        try std.process.spawn(io, .{
-            .argv = argv,
-            .cwd = .{ .path = cwd },
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        })
-    else
-        try std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        });
+    var spawn_options: std.process.SpawnOptions = .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        // A dedicated process group lets cancellation terminate descendants
+        // without an extra setsid wrapper process.
+        .pgid = if (builtin.os.tag == .linux) 0 else null,
+    };
+    if (input.cwd) |cwd| spawn_options.cwd = .{ .path = cwd };
+    var child = try std.process.spawn(io, spawn_options);
 
     // After spawn, every error path must terminate the child.
     var child_finished = false;
@@ -657,4 +654,19 @@ test "timeout preserves earlier stdout" {
             "before-timeout",
         ) != null,
     );
+}
+
+test "linux exec supports bash syntax" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const result = try run(
+        allocator,
+        std.testing.io,
+        .{ .command = "printf '%s\\n' {alpha,beta}" },
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("alpha\nbeta\n", result.stdout);
+    try std.testing.expect(result.succeeded());
 }

@@ -13,9 +13,9 @@ pub const ListResult = manager.ListResult;
 
 var global_manager: ?manager.Manager = null;
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io) void {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_map: anytype) !void {
     std.debug.assert(global_manager == null);
-    global_manager = manager.Manager.init(allocator, io);
+    global_manager = try manager.Manager.init(allocator, io, environ_map);
 }
 
 pub fn deinit() void {

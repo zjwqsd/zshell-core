@@ -51,9 +51,8 @@ fn terminateWindowsTree(child: *std.process.Child, io: std.Io) void {
 fn terminateLinuxGroup(child: *std.process.Child, io: std.Io) void {
     const pid = child.id orelse return;
 
-    // Managed Linux children are launched through setsid, which makes the
-    // command the leader of a fresh session and process group. A negative PID
-    // addresses that whole group without sharing ShellCore's controlling TTY.
+    // Managed Linux children are launched in a dedicated process group whose
+    // group ID equals the child PID. A negative PID addresses that whole group.
     std.posix.kill(-pid, .KILL) catch {};
 
     // Reap/clean up the direct child handle. This is also a fallback if the group

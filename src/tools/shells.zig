@@ -7,6 +7,7 @@ pub const Status = manager.Status;
 pub const StartInput = manager.StartInput;
 pub const StartResult = manager.StartResult;
 pub const WriteResult = manager.WriteResult;
+pub const ResizeResult = manager.ResizeResult;
 pub const ReadResult = manager.ReadResult;
 pub const KillResult = manager.KillResult;
 pub const ListItem = manager.ListItem;
@@ -15,9 +16,9 @@ pub const backend_name = manager.backend_name;
 
 var global_manager: ?manager.Manager = null;
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io) void {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_map: anytype) !void {
     std.debug.assert(global_manager == null);
-    global_manager = manager.Manager.init(allocator, io);
+    global_manager = try manager.Manager.init(allocator, io, environ_map);
 }
 
 pub fn deinit() void {
@@ -37,6 +38,10 @@ pub fn write(
     enter: bool,
 ) !WriteResult {
     return getManager().write(shell_id, input, enter);
+}
+
+pub fn resize(shell_id: ShellId, cols: u16, rows: u16) !ResizeResult {
+    return getManager().resize(shell_id, cols, rows);
 }
 
 pub fn read(

@@ -32,7 +32,8 @@ fn bindHumanControl(io: std.Io) !BoundControl {
 
 const PublicJob = struct {
     jobId: u64,
-    command: []const u8,
+    program: []const u8,
+    args: []const []const u8,
     cwd: ?[]const u8,
     status: []const u8,
     exitCode: ?u8,
@@ -41,7 +42,11 @@ const PublicJob = struct {
 
 const PublicShell = struct {
     shellId: u64,
+    shell: []const u8,
+    args: []const []const u8,
     initialCwd: ?[]const u8,
+    cols: u16,
+    rows: u16,
     status: []const u8,
     exitCode: ?u8,
     terminationSource: ?[]const u8,
@@ -212,7 +217,8 @@ fn respondState(
     for (job_list.items, public_jobs) |job, *public| {
         public.* = .{
             .jobId = job.job_id,
-            .command = job.command,
+            .program = job.program,
+            .args = job.args,
             .cwd = job.cwd,
             .status = job.status.name(),
             .exitCode = job.exit_code,
@@ -227,7 +233,11 @@ fn respondState(
     for (shell_list.items, public_shells) |shell, *public| {
         public.* = .{
             .shellId = shell.shell_id,
+            .shell = shell.shell,
+            .args = shell.args,
             .initialCwd = shell.initial_cwd,
+            .cols = shell.cols,
+            .rows = shell.rows,
             .status = shell.status.name(),
             .exitCode = shell.exit_code,
             .terminationSource = if (shell.termination_source) |source| source.name() else null,

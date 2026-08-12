@@ -30,10 +30,10 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("browser feature disabled; start with --browser to enable it", .{});
     }
 
-    zshell.tools.jobs.init(init.gpa, init.io);
+    try zshell.tools.jobs.init(init.gpa, init.io, init.environ_map);
     defer zshell.tools.jobs.deinit();
 
-    zshell.tools.shells.init(init.gpa, init.io);
+    try zshell.tools.shells.init(init.gpa, init.io, init.environ_map);
     defer zshell.tools.shells.deinit();
 
     const human_thread = try std.Thread.spawn(

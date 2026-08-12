@@ -24,7 +24,8 @@ pub const Status = enum {
 };
 
 pub const StartInput = struct {
-    command: []const u8,
+    program: []const u8,
+    args: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
 };
 
@@ -35,7 +36,8 @@ pub const StartResult = struct {
 
 pub const StatusResult = struct {
     job_id: JobId,
-    command: []const u8,
+    program: []const u8,
+    args: []const []const u8,
     cwd: ?[]const u8,
     status: Status,
     exit_code: ?u8,
@@ -69,7 +71,8 @@ pub const LogsResult = struct {
 
 pub const ListItem = struct {
     job_id: JobId,
-    command: []const u8,
+    program: []const u8,
+    args: []const []const u8,
     cwd: ?[]const u8,
     status: Status,
     exit_code: ?u8,
@@ -89,7 +92,8 @@ pub const Error = error{JobNotFound};
 const Job = struct {
     id: JobId,
     io: std.Io,
-    command: []u8,
+    program: []u8,
+    args: [][]u8,
     cwd: ?[]u8,
 
     mutex: std.Io.Mutex = .init,
@@ -107,7 +111,8 @@ const Job = struct {
     thread_claimed: bool = false,
 
     fn deinit(self: *Job, allocator: std.mem.Allocator) void {
-        allocator.free(self.command);
+        allocator.free(self.program);
+        freeArgs(allocator, self.args);
         if (self.cwd) |cwd| allocator.free(cwd);
         self.stdout.deinit(allocator);
         self.stderr.deinit(allocator);
@@ -118,14 +123,22 @@ const Job = struct {
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    child_environ: std.process.Environ.Map,
     mutex: std.Io.Mutex = .init,
     jobs: std.AutoHashMap(JobId, *Job),
     next_id: JobId = 1,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) Manager {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_map: anytype) !Manager {
+        var child_environ = try environ_map.clone(allocator);
+        errdefer child_environ.deinit();
+        _ = child_environ.swapRemove(secrets.device_token_environment);
+        _ = child_environ.swapRemove(secrets.oauth_admin_pin_environment);
+        _ = child_environ.swapRemove(secrets.oauth_jwt_secret_environment);
+
         return .{
             .allocator = allocator,
             .io = io,
+            .child_environ = child_environ,
             .jobs = std.AutoHashMap(JobId, *Job).init(allocator),
         };
     }
@@ -152,16 +165,19 @@ pub const Manager = struct {
         }
 
         self.jobs.deinit();
+        self.child_environ.deinit();
         self.* = undefined;
     }
 
     pub fn start(self: *Manager, input: StartInput) !StartResult {
-        if (input.command.len == 0) return error.EmptyCommand;
+        if (input.program.len == 0) return error.EmptyProgram;
 
         // Jobs outlive the request that created them, so request-owned strings
         // are copied into the manager allocator.
-        const command = try self.allocator.dupe(u8, input.command);
-        errdefer self.allocator.free(command);
+        const program = try self.allocator.dupe(u8, input.program);
+        errdefer self.allocator.free(program);
+        const args = try dupeArgs(self.allocator, input.args);
+        errdefer freeArgs(self.allocator, args);
 
         const cwd = if (input.cwd) |value|
             try self.allocator.dupe(u8, value)
@@ -186,14 +202,15 @@ pub const Manager = struct {
         job.* = .{
             .id = job_id,
             .io = self.io,
-            .command = command,
+            .program = program,
+            .args = args,
             .cwd = cwd,
             .stdout = stdout,
             .stderr = stderr,
         };
 
         // A successful start means the OS process has already been created.
-        var child = try spawnShell(self.allocator, self.io, input);
+        var child = try spawnDirectProcess(self.allocator, self.io, &self.child_environ, input.program, input.args, input.cwd);
         var child_owned = true;
         errdefer if (child_owned) process_tree.terminate(&child, self.io);
 
@@ -227,7 +244,7 @@ pub const Manager = struct {
         job.thread = thread;
         job.mutex.unlock(job.io);
 
-        events.record(self.io, .agent, "job.started", .job, job_id, input.command);
+        events.record(self.io, .agent, "job.started", .job, job_id, input.program);
         return .{ .job_id = job_id, .status = .running };
     }
 
@@ -308,7 +325,8 @@ pub const Manager = struct {
             job.mutex.lockUncancelable(job.io);
             items[index] = .{
                 .job_id = job.id,
-                .command = job.command,
+                .program = job.program,
+                .args = job.args,
                 .cwd = job.cwd,
                 .status = job.status,
                 .exit_code = job.exit_code,
@@ -455,7 +473,8 @@ fn setTerminated(job: *Job, term: std.process.Child.Term) void {
 fn snapshotStatus(job: *const Job) StatusResult {
     return .{
         .job_id = job.id,
-        .command = job.command,
+        .program = job.program,
+        .args = job.args,
         .cwd = job.cwd,
         .status = job.status,
         .exit_code = job.exit_code,
@@ -490,86 +509,58 @@ fn reapFinishedThread(job: *Job) void {
     }
 }
 
-fn spawnShell(
+fn dupeArgs(allocator: std.mem.Allocator, args: []const []const u8) ![][]u8 {
+    const copied = try allocator.alloc([]u8, args.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copied[0..initialized]) |arg| allocator.free(arg);
+        allocator.free(copied);
+    }
+    for (args, copied) |arg, *dest| {
+        dest.* = try allocator.dupe(u8, arg);
+        initialized += 1;
+    }
+    return copied;
+}
+
+fn freeArgs(allocator: std.mem.Allocator, args: [][]u8) void {
+    for (args) |arg| allocator.free(arg);
+    allocator.free(args);
+}
+
+fn spawnDirectProcess(
     allocator: std.mem.Allocator,
     io: std.Io,
-    input: StartInput,
+    environ_map: *const std.process.Environ.Map,
+    program: []const u8,
+    args: []const []const u8,
+    cwd: ?[]const u8,
 ) !std.process.Child {
-    return switch (builtin.os.tag) {
-        .windows => blk: {
-            var command_writer: std.Io.Writer.Allocating = .init(allocator);
-            defer command_writer.deinit();
-
-            try command_writer.writer.writeAll(secrets.powershell_clear);
-            try command_writer.writer.writeAll(
-                "$__zshell_utf8 = " ++
-                    "[System.Text.UTF8Encoding]::new($false); " ++
-                    "[Console]::OutputEncoding = $__zshell_utf8; " ++
-                    "$OutputEncoding = $__zshell_utf8; ",
-            );
-            try command_writer.writer.writeAll(input.command);
-
-            break :blk try spawnProcess(
-                io,
-                &.{
-                    "powershell.exe",
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    command_writer.written(),
-                },
-                input.cwd,
-            );
-        },
-        .linux => blk: {
-            var command_writer: std.Io.Writer.Allocating = .init(allocator);
-            defer command_writer.deinit();
-            try command_writer.writer.writeAll(secrets.posix_clear);
-            try command_writer.writer.writeAll(input.command);
-
-            break :blk try spawnProcess(
-                io,
-                &.{ "setsid", "/bin/sh", "-c", command_writer.written() },
-                input.cwd,
-            );
-        },
-        else => blk: {
-            var command_writer: std.Io.Writer.Allocating = .init(allocator);
-            defer command_writer.deinit();
-            try command_writer.writer.writeAll(secrets.posix_clear);
-            try command_writer.writer.writeAll(input.command);
-
-            break :blk try spawnProcess(
-                io,
-                &.{ "/bin/sh", "-c", command_writer.written() },
-                input.cwd,
-            );
-        },
-    };
+    const argv = try allocator.alloc([]const u8, args.len + 1);
+    defer allocator.free(argv);
+    argv[0] = program;
+    @memcpy(argv[1..], args);
+    return spawnProcess(io, argv, cwd, environ_map);
 }
 
 fn spawnProcess(
     io: std.Io,
     argv: []const []const u8,
     cwd: ?[]const u8,
+    environ_map: *const std.process.Environ.Map,
 ) !std.process.Child {
-    if (cwd) |value| {
-        return try std.process.spawn(io, .{
-            .argv = argv,
-            .cwd = .{ .path = value },
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        });
-    }
-
-    return try std.process.spawn(io, .{
+    var spawn_options: std.process.SpawnOptions = .{
         .argv = argv,
+        .environ_map = environ_map,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-    });
+        // On Linux this makes the direct child the leader of its own process
+        // group, so job_stop can terminate the complete descendant tree.
+        .pgid = if (builtin.os.tag == .linux) 0 else null,
+    };
+    if (cwd) |value| spawn_options.cwd = .{ .path = value };
+    return std.process.spawn(io, spawn_options);
 }
 
 fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {
@@ -586,4 +577,36 @@ fn terminationFromTerm(term: std.process.Child.Term) []const u8 {
         .stopped => "stopped",
         .unknown => "unknown",
     };
+}
+
+test "direct process job preserves argv boundaries" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+
+    var manager = try Manager.init(allocator, std.testing.io, &environ);
+    defer manager.deinit();
+
+    const started = try manager.start(.{
+        .program = "/usr/bin/printf",
+        .args = &.{ "<%s>", "hello world" },
+    });
+
+    var finished = false;
+    for (0..100) |_| {
+        const current = try manager.status(started.job_id);
+        if (current.status != .running) {
+            finished = true;
+            break;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(finished);
+
+    const logs = try manager.logs(allocator, started.job_id, null, null);
+    defer logs.deinit(allocator);
+    try std.testing.expectEqualStrings("<hello world>", logs.stdout);
+    try std.testing.expectEqualStrings("", logs.stderr);
 }

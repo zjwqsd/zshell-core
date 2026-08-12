@@ -7,8 +7,8 @@ ShellCore contains the operating-system execution capabilities and connects outb
 ## Responsibilities
 
 - execute short-lived commands
-- manage background jobs
-- manage persistent shell sessions
+- manage direct-process background jobs
+- manage interactive terminal sessions (PTY on Linux, ConPTY on Windows)
 - read/write files
 - report environment information
 - provide local Human Control on loopback ports starting at `8766`

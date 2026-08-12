@@ -28,6 +28,12 @@ const ShellWriteArguments = struct {
     enter: bool = true,
 };
 
+const ShellResizeArguments = struct {
+    shellId: u64,
+    cols: u16,
+    rows: u16,
+};
+
 const StreamReadArguments = struct {
     id: u64,
     stdout_after: ?u64 = null,
@@ -95,7 +101,7 @@ pub fn dispatch(
         return execute(allocator, io, request.arguments, writer);
     }
     if (std.mem.eql(u8, request.operation, "job_start")) {
-        return jobStart(request.arguments, writer);
+        return jobStart(allocator, request.arguments, writer);
     }
     if (std.mem.eql(u8, request.operation, "job_status")) {
         return jobStatus(request.arguments, writer);
@@ -110,13 +116,16 @@ pub fn dispatch(
         return jobList(allocator, request.arguments, writer);
     }
     if (std.mem.eql(u8, request.operation, "shell_start")) {
-        return shellStart(request.arguments, writer);
+        return shellStart(allocator, request.arguments, writer);
     }
     if (std.mem.eql(u8, request.operation, "shell_write")) {
         return shellWrite(request.arguments, writer);
     }
     if (std.mem.eql(u8, request.operation, "shell_read")) {
         return shellRead(allocator, request.arguments, writer);
+    }
+    if (std.mem.eql(u8, request.operation, "shell_resize")) {
+        return shellResize(request.arguments, writer);
     }
     if (std.mem.eql(u8, request.operation, "shell_kill")) {
         return shellKill(request.arguments, writer);
@@ -159,6 +168,7 @@ fn isMutating(operation: []const u8) bool {
         std.mem.eql(u8, operation, "job_stop") or
         std.mem.eql(u8, operation, "shell_start") or
         std.mem.eql(u8, operation, "shell_write") or
+        std.mem.eql(u8, operation, "shell_resize") or
         std.mem.eql(u8, operation, "shell_kill") or
         std.mem.eql(u8, operation, "file_write") or
         std.mem.eql(u8, operation, "file_mkdir") or
@@ -265,16 +275,15 @@ fn execute(
 }
 
 fn jobStart(
+    allocator: std.mem.Allocator,
     arguments: ?std.json.Value,
     writer: *std.Io.Writer,
 ) !Outcome {
-    const input = try parseJobStartInput(arguments, writer) orelse {
+    var args_storage: std.ArrayList([]const u8) = .empty;
+    defer args_storage.deinit(allocator);
+    const input = try parseJobStartInput(allocator, arguments, &args_storage, writer) orelse {
         return .bad_request;
     };
-    if (input.command.len == 0) {
-        try writeInvalidRequest(writer, "command must not be empty");
-        return .bad_request;
-    }
 
     const result = jobs.start(input) catch |err| {
         try writeFailure(writer, @errorName(err), "Job could not be started");
@@ -329,7 +338,8 @@ fn jobStop(
 fn writeJobStatus(writer: *std.Io.Writer, result: jobs.StatusResult) !void {
     try writeSuccess(writer, .{
         .jobId = result.job_id,
-        .command = result.command,
+        .program = result.program,
+        .args = result.args,
         .cwd = result.cwd,
         .status = result.status.name(),
         .exitCode = result.exit_code,
@@ -412,10 +422,13 @@ fn jobList(
 }
 
 fn shellStart(
+    allocator: std.mem.Allocator,
     arguments: ?std.json.Value,
     writer: *std.Io.Writer,
 ) !Outcome {
-    const input = try parseShellStartInput(arguments, writer) orelse {
+    var args_storage: std.ArrayList([]const u8) = .empty;
+    defer args_storage.deinit(allocator);
+    const input = try parseShellStartInput(allocator, arguments, &args_storage, writer) orelse {
         return .bad_request;
     };
     return startShell(input, writer);
@@ -432,7 +445,11 @@ fn startShell(
 
     try writeSuccess(writer, .{
         .shellId = result.shell_id,
+        .shell = result.shell,
+        .args = result.args,
         .initialCwd = result.initial_cwd,
+        .cols = result.cols,
+        .rows = result.rows,
         .status = result.status.name(),
         .backend = result.backend,
     }, false);
@@ -471,6 +488,35 @@ fn shellWrite(
     return .ok;
 }
 
+fn shellResize(
+    arguments: ?std.json.Value,
+    writer: *std.Io.Writer,
+) !Outcome {
+    const input = try parseShellResizeInput(arguments, writer) orelse {
+        return .bad_request;
+    };
+    const result = shells.resize(input.shellId, input.cols, input.rows) catch |err| switch (err) {
+        error.ShellNotFound => {
+            try writeFailure(writer, "ShellNotFound", "Persistent shell was not found");
+            return .ok;
+        },
+        error.ShellNotRunning => {
+            try writeFailure(writer, "ShellNotRunning", "Persistent shell is not running");
+            return .ok;
+        },
+        else => {
+            try writeFailure(writer, @errorName(err), "Terminal could not be resized");
+            return .ok;
+        },
+    };
+    try writeSuccess(writer, .{
+        .shellId = result.shell_id,
+        .cols = result.cols,
+        .rows = result.rows,
+    }, false);
+    return .ok;
+}
+
 fn shellRead(
     allocator: std.mem.Allocator,
     arguments: ?std.json.Value,
@@ -505,7 +551,11 @@ fn shellRead(
 
     try writeSuccess(writer, .{
         .shellId = result.shell_id,
+        .shell = result.shell,
+        .args = result.args,
         .initialCwd = result.initial_cwd,
+        .cols = result.cols,
+        .rows = result.rows,
         .status = result.status.name(),
         .exitCode = result.exit_code,
         .termination = result.termination,
@@ -570,7 +620,11 @@ fn shellList(
 
     const PublicItem = struct {
         shellId: u64,
+        shell: []const u8,
+        args: []const []const u8,
         initialCwd: ?[]const u8,
+        cols: u16,
+        rows: u16,
         status: []const u8,
         exitCode: ?u8,
         terminationSource: ?[]const u8,
@@ -581,7 +635,11 @@ fn shellList(
     for (result.items, items) |item, *public| {
         public.* = .{
             .shellId = item.shell_id,
+            .shell = item.shell,
+            .args = item.args,
             .initialCwd = item.initial_cwd,
+            .cols = item.cols,
+            .rows = item.rows,
             .status = item.status.name(),
             .exitCode = item.exit_code,
             .terminationSource = if (item.termination_source) |source| source.name() else null,
@@ -645,7 +703,9 @@ fn parseExecInput(
 }
 
 fn parseJobStartInput(
+    allocator: std.mem.Allocator,
     arguments: ?std.json.Value,
+    args_storage: *std.ArrayList([]const u8),
     writer: *std.Io.Writer,
 ) !?jobs.StartInput {
     const value = arguments orelse {
@@ -654,13 +714,32 @@ fn parseJobStartInput(
     };
     return switch (value) {
         .object => |object| blk: {
-            if (!hasOnlyFields(object, &.{ "command", "cwd" })) {
+            if (!hasOnlyFields(object, &.{ "program", "args", "cwd" })) {
                 try writeInvalidRequest(writer, "Invalid job_start arguments");
                 break :blk null;
             }
-            const command = getString(object, "command") orelse {
-                try writeInvalidRequest(writer, "command must be a string");
+            const program = getString(object, "program") orelse {
+                try writeInvalidRequest(writer, "program must be a string");
                 break :blk null;
+            };
+            if (program.len == 0) {
+                try writeInvalidRequest(writer, "program must not be empty");
+                break :blk null;
+            }
+            if (object.get("args")) |args_value| switch (args_value) {
+                .array => |array| {
+                    for (array.items) |arg_value| switch (arg_value) {
+                        .string => |text| try args_storage.append(allocator, text),
+                        else => {
+                            try writeInvalidRequest(writer, "args must be an array of strings");
+                            break :blk null;
+                        },
+                    };
+                },
+                else => {
+                    try writeInvalidRequest(writer, "args must be an array of strings");
+                    break :blk null;
+                },
             };
             const cwd = if (object.get("cwd")) |cwd_value| switch (cwd_value) {
                 .string => |text| text,
@@ -669,7 +748,11 @@ fn parseJobStartInput(
                     break :blk null;
                 },
             } else null;
-            break :blk jobs.StartInput{ .command = command, .cwd = cwd };
+            break :blk jobs.StartInput{
+                .program = program,
+                .args = args_storage.items,
+                .cwd = cwd,
+            };
         },
         else => blk: {
             try writeInvalidRequest(writer, "arguments must be an object");
@@ -679,16 +762,46 @@ fn parseJobStartInput(
 }
 
 fn parseShellStartInput(
+    allocator: std.mem.Allocator,
     arguments: ?std.json.Value,
+    args_storage: *std.ArrayList([]const u8),
     writer: *std.Io.Writer,
 ) !?shells.StartInput {
     const value = arguments orelse return shells.StartInput{};
     return switch (value) {
         .object => |object| blk: {
-            if (!hasOnlyFields(object, &.{"cwd"})) {
+            if (!hasOnlyFields(object, &.{ "shell", "args", "cwd", "cols", "rows" })) {
                 try writeInvalidRequest(writer, "Invalid shell_start arguments");
                 break :blk null;
             }
+            const shell = if (object.get("shell")) |shell_value| switch (shell_value) {
+                .string => |text| blk_shell: {
+                    if (text.len == 0) {
+                        try writeInvalidRequest(writer, "shell must not be empty");
+                        break :blk null;
+                    }
+                    break :blk_shell text;
+                },
+                else => {
+                    try writeInvalidRequest(writer, "shell must be a string");
+                    break :blk null;
+                },
+            } else null;
+            if (object.get("args")) |args_value| switch (args_value) {
+                .array => |array| {
+                    for (array.items) |arg_value| switch (arg_value) {
+                        .string => |text| try args_storage.append(allocator, text),
+                        else => {
+                            try writeInvalidRequest(writer, "args must be an array of strings");
+                            break :blk null;
+                        },
+                    };
+                },
+                else => {
+                    try writeInvalidRequest(writer, "args must be an array of strings");
+                    break :blk null;
+                },
+            };
             const cwd = if (object.get("cwd")) |cwd_value| switch (cwd_value) {
                 .string => |text| text,
                 else => {
@@ -696,7 +809,70 @@ fn parseShellStartInput(
                     break :blk null;
                 },
             } else null;
-            break :blk shells.StartInput{ .cwd = cwd };
+            const cols = try parseTerminalDimension(object, "cols", 120, writer) orelse break :blk null;
+            const rows = try parseTerminalDimension(object, "rows", 30, writer) orelse break :blk null;
+            break :blk shells.StartInput{
+                .shell = shell,
+                .args = args_storage.items,
+                .cwd = cwd,
+                .cols = cols,
+                .rows = rows,
+            };
+        },
+        else => blk: {
+            try writeInvalidRequest(writer, "arguments must be an object");
+            break :blk null;
+        },
+    };
+}
+
+fn parseTerminalDimension(
+    object: std.json.ObjectMap,
+    name: []const u8,
+    default_value: u16,
+    writer: *std.Io.Writer,
+) !?u16 {
+    const value = object.get(name) orelse return default_value;
+    return switch (value) {
+        .integer => |number| blk: {
+            if (number <= 0 or number > std.math.maxInt(u16)) {
+                try writeInvalidRequest(writer, "terminal dimensions must be integers from 1 to 65535");
+                break :blk null;
+            }
+            break :blk @intCast(number);
+        },
+        else => blk: {
+            try writeInvalidRequest(writer, "terminal dimensions must be integers");
+            break :blk null;
+        },
+    };
+}
+
+fn parseShellResizeInput(
+    arguments: ?std.json.Value,
+    writer: *std.Io.Writer,
+) !?ShellResizeArguments {
+    const value = arguments orelse {
+        try writeInvalidRequest(writer, "shell_resize requires arguments");
+        return null;
+    };
+    return switch (value) {
+        .object => |object| blk: {
+            if (!hasOnlyFields(object, &.{ "shellId", "cols", "rows" })) {
+                try writeInvalidRequest(writer, "Invalid shell_resize arguments");
+                break :blk null;
+            }
+            const shell_id = getPositiveId(object, "shellId") orelse {
+                try writeInvalidRequest(writer, "shellId must be a positive integer");
+                break :blk null;
+            };
+            const cols = try parseTerminalDimension(object, "cols", 0, writer) orelse break :blk null;
+            const rows = try parseTerminalDimension(object, "rows", 0, writer) orelse break :blk null;
+            if (object.get("cols") == null or object.get("rows") == null) {
+                try writeInvalidRequest(writer, "shell_resize requires cols and rows");
+                break :blk null;
+            }
+            break :blk .{ .shellId = shell_id, .cols = cols, .rows = rows };
         },
         else => blk: {
             try writeInvalidRequest(writer, "arguments must be an object");
