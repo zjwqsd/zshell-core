@@ -122,7 +122,9 @@ fn connectAndServe(
         defer allocator.free(frame.payload);
 
         if (frame.kind == .binary) {
-            try transfers.handleBinary(frame.payload);
+            transfers.handleBinary(frame.payload) catch |err| {
+                std.log.warn("ignored invalid or stale transfer frame: {s}", .{@errorName(err)});
+            };
             continue;
         }
         if (try transfers.handleText(frame.payload)) continue;

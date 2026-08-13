@@ -174,11 +174,11 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         const state = self.target orelse {
             self.mutex.unlock(self.io);
-            return error.UnexpectedTransferFrame;
+            return;
         };
         if (!std.mem.eql(u8, &state.id, &id)) {
             self.mutex.unlock(self.io);
-            return error.TransferIdMismatch;
+            return;
         }
         if (sequence != state.next_sequence) {
             const id_text = state.id_text;
