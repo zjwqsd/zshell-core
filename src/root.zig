@@ -2,6 +2,7 @@ pub const version = @import("version.zig");
 
 pub const device = struct {
     pub const client = @import("device/client.zig");
+    pub const transfer = @import("device/transfer.zig");
 };
 
 pub const protocol = struct {

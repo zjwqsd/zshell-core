@@ -10,6 +10,7 @@ ShellCore contains the operating-system execution capabilities and connects outb
 - manage direct-process background jobs
 - manage interactive terminal sessions (PTY on Linux, ConPTY on Windows)
 - read/write files
+- stream files between ShellCore devices through Gateway
 - report environment information
 - provide local Human Control on loopback ports starting at `8766`
 - connect outbound to `/device/ws`
@@ -90,9 +91,17 @@ If either dependency is missing, ShellCore exits instead of starting with a part
 
 ## Transport
 
-The WebSocket upgrade includes the device token in the HTTP `Authorization` header. After the upgrade, Core sends its name, workspace, OS, architecture and version as the protocol-v2 hello message.
+The WebSocket upgrade includes the device token in the HTTP `Authorization` header. After the upgrade, Core sends its name, workspace, OS, architecture and version as the protocol-v3 hello message.
 
-All calls and results then stay on that persistent WebSocket. Client-to-server WebSocket frames are masked as required by RFC 6455, server frames are validated, and messages larger than 8 MiB are rejected.
+Protocol v3 carries normal calls/results and transfer-control messages as WebSocket text frames. Cross-device file payloads use raw WebSocket binary frames, so file bytes are not base64-encoded and do not pass through the MCP/model context. Client-to-server WebSocket frames are masked as required by RFC 6455, server frames are validated, and individual messages larger than 8 MiB are rejected.
+
+## Cross-device file transfer
+
+File transfer is always available; unlike browser automation it does not require a startup flag or external executable. Gateway coordinates a source Core and a target Core over their existing outbound WebSockets.
+
+The source reads the file in 256 KiB chunks and computes SHA-256 while streaming. Gateway forwards each binary frame directly to the target and does not buffer the whole file. The target writes to `<target>.zshell-part`, computes its own SHA-256, verifies size and hash against the source, then renames the temporary file to the requested destination. Failed or cancelled transfers remove the temporary part file.
+
+The target side is a mutating action and obeys Human Control: a new transfer is rejected while the human owns execution control. Running transfers are left unchanged, matching the behavior of existing running jobs and executions.
 
 ## Human Control
 

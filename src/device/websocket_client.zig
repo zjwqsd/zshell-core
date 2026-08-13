@@ -8,6 +8,7 @@ pub const Connection = struct {
     io: std.Io,
     client: *std.http.Client,
     connection: *std.http.Client.Connection,
+    write_mutex: std.Io.Mutex = .init,
 
     pub fn connect(
         allocator: std.mem.Allocator,
@@ -78,11 +79,25 @@ pub const Connection = struct {
         self.* = undefined;
     }
 
-    pub fn readText(self: *Connection) ![]u8 {
+    pub const MessageKind = enum {
+        text,
+        binary,
+    };
+
+    pub const Message = struct {
+        kind: MessageKind,
+        payload: []u8,
+    };
+
+    /// Read one application WebSocket message while transparently handling
+    /// protocol-level ping/pong/close frames. Text and binary payloads are
+    /// returned to the ShellCore device protocol unchanged.
+    pub fn readMessage(self: *Connection) !Message {
         while (true) {
             const message = try self.readFrame();
             switch (message.opcode) {
-                .text => return message.payload,
+                .text => return .{ .kind = .text, .payload = message.payload },
+                .binary => return .{ .kind = .binary, .payload = message.payload },
                 .ping => {
                     defer self.allocator.free(message.payload);
                     try self.writeFrame(.pong, message.payload);
@@ -101,8 +116,19 @@ pub const Connection = struct {
         }
     }
 
+    pub fn readText(self: *Connection) ![]u8 {
+        const message = try self.readMessage();
+        if (message.kind == .text) return message.payload;
+        self.allocator.free(message.payload);
+        return error.ExpectedWebSocketTextMessage;
+    }
+
     pub fn writeText(self: *Connection, payload: []const u8) !void {
         try self.writeFrame(.text, payload);
+    }
+
+    pub fn writeBinary(self: *Connection, payload: []const u8) !void {
+        try self.writeFrame(.binary, payload);
     }
 
     const Opcode = enum(u4) {
@@ -115,12 +141,12 @@ pub const Connection = struct {
         _,
     };
 
-    const Message = struct {
+    const Frame = struct {
         opcode: Opcode,
         payload: []u8,
     };
 
-    fn readFrame(self: *Connection) !Message {
+    fn readFrame(self: *Connection) !Frame {
         const reader = self.connection.reader();
         var header: [2]u8 = undefined;
         try reader.readSliceAll(&header);
@@ -156,6 +182,9 @@ pub const Connection = struct {
     }
 
     fn writeFrame(self: *Connection, opcode: Opcode, payload: []const u8) !void {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
         if (payload.len > max_message_size) return error.WebSocketMessageTooLarge;
         if (@intFromEnum(opcode) >= 8 and payload.len > 125) return error.InvalidControlFrame;
 
