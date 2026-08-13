@@ -2,6 +2,8 @@ const std = @import("std");
 const zshell = @import("root.zig");
 
 pub fn main(init: std.process.Init) !void {
+    zshell.runtime.session_process.runIfRequested(init);
+
     const browser_enabled = try parseBrowserOption(init);
 
     zshell.tools.browser.init(init.gpa, init.io, init.environ_map, browser_enabled) catch |err| {

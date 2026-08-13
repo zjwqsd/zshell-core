@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const secrets = @import("../runtime/secrets.zig");
 const process_tree = @import("../runtime/process_tree.zig");
+const session_process = @import("../runtime/session_process.zig");
 
 const TailBuffer = @import("tail_buffer.zig").TailBuffer;
 const events = @import("../control/events.zig");
@@ -540,10 +541,11 @@ fn spawnDirectProcess(
     defer allocator.free(argv);
     argv[0] = program;
     @memcpy(argv[1..], args);
-    return spawnProcess(io, argv, cwd, environ_map);
+    return spawnProcess(allocator, io, argv, cwd, environ_map);
 }
 
 fn spawnProcess(
+    allocator: std.mem.Allocator,
     io: std.Io,
     argv: []const []const u8,
     cwd: ?[]const u8,
@@ -555,12 +557,9 @@ fn spawnProcess(
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-        // On Linux this makes the direct child the leader of its own process
-        // group, so job_stop can terminate the complete descendant tree.
-        .pgid = if (builtin.os.tag == .linux) 0 else null,
     };
     if (cwd) |value| spawn_options.cwd = .{ .path = value };
-    return std.process.spawn(io, spawn_options);
+    return session_process.spawnManaged(allocator, io, spawn_options);
 }
 
 fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {

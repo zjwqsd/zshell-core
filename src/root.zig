@@ -43,5 +43,6 @@ pub const runtime = struct {
     pub const source = @import("runtime/source.zig");
     pub const ports = @import("runtime/ports.zig");
     pub const secrets = @import("runtime/secrets.zig");
+    pub const session_process = @import("runtime/session_process.zig");
     pub const terminal = @import("runtime/terminal.zig");
 };

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const secrets = @import("../runtime/secrets.zig");
 const process_tree = @import("../runtime/process_tree.zig");
+const session_process = @import("../runtime/session_process.zig");
 pub const Source = @import("../runtime/source.zig").Source;
 
 pub const default_timeout_ms: u64 = 60_000;
@@ -160,12 +161,9 @@ fn runProcess(
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-        // A dedicated process group lets cancellation terminate descendants
-        // without an extra setsid wrapper process.
-        .pgid = if (builtin.os.tag == .linux) 0 else null,
     };
     if (input.cwd) |cwd| spawn_options.cwd = .{ .path = cwd };
-    var child = try std.process.spawn(io, spawn_options);
+    var child = try session_process.spawnManaged(allocator, io, spawn_options);
 
     // After spawn, every error path must terminate the child.
     var child_finished = false;
