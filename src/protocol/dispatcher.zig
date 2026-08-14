@@ -171,6 +171,7 @@ fn isMutating(operation: []const u8) bool {
         std.mem.eql(u8, operation, "shell_resize") or
         std.mem.eql(u8, operation, "shell_kill") or
         std.mem.eql(u8, operation, "file_write") or
+        std.mem.eql(u8, operation, "file_patch") or
         std.mem.eql(u8, operation, "file_mkdir") or
         std.mem.eql(u8, operation, "browser_start") or
         std.mem.eql(u8, operation, "browser_open") or

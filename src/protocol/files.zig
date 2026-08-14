@@ -24,8 +24,14 @@ pub fn dispatch(
     if (std.mem.eql(u8, operation, "file_read")) {
         return @as(?Outcome, try fileRead(allocator, io, arguments, writer));
     }
+    if (std.mem.eql(u8, operation, "file_search")) {
+        return @as(?Outcome, try fileSearch(allocator, io, arguments, writer));
+    }
     if (std.mem.eql(u8, operation, "file_write")) {
         return @as(?Outcome, try fileWrite(allocator, io, arguments, writer));
+    }
+    if (std.mem.eql(u8, operation, "file_patch")) {
+        return @as(?Outcome, try filePatch(allocator, io, arguments, writer));
     }
     if (std.mem.eql(u8, operation, "file_mkdir")) {
         return @as(?Outcome, try fileMkdir(io, arguments, writer));
@@ -119,6 +125,52 @@ fn fileRead(
             .encoding = encoded.encoding,
             .data = encoded.data,
         },
+    }, false);
+    return .ok;
+}
+
+fn fileSearch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    arguments: ?std.json.Value,
+    writer: *std.Io.Writer,
+) !Outcome {
+    const input = try parseFileSearchInput(arguments, writer) orelse return .bad_request;
+    const result = filesystem.search(allocator, io, input) catch |err| {
+        try writeFailure(writer, @errorName(err), "Failed to search files");
+        return .ok;
+    };
+    defer result.deinit(allocator);
+
+    try writeSuccess(writer, .{
+        .path = result.path,
+        .query = result.query,
+        .matches = result.matches,
+        .truncated = result.truncated,
+    }, false);
+    return .ok;
+}
+
+fn filePatch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    arguments: ?std.json.Value,
+    writer: *std.Io.Writer,
+) !Outcome {
+    const input = try parseFilePatchInput(arguments, writer) orelse return .bad_request;
+    const result = filesystem.patch(allocator, io, input) catch |err| {
+        try writeFailure(writer, @errorName(err), switch (err) {
+            error.InvalidPatch => "Patch is not a valid unified diff",
+            error.PatchContextMismatch => "Patch context does not match the current file",
+            else => "Failed to patch file",
+        });
+        return .ok;
+    };
+
+    try writeSuccess(writer, .{
+        .path = result.path,
+        .hunksApplied = result.hunks_applied,
+        .size = result.size,
     }, false);
     return .ok;
 }
@@ -285,6 +337,108 @@ fn parseFileReadInput(
                 writer,
             ) orelse break :blk null;
             break :blk .{ .path = path, .offset = offset, .max_bytes = max_bytes };
+        },
+        else => blk: {
+            try writeInvalidRequest(writer, "arguments must be an object");
+            break :blk null;
+        },
+    };
+}
+
+fn parseFileSearchInput(
+    arguments: ?std.json.Value,
+    writer: *std.Io.Writer,
+) !?filesystem.SearchInput {
+    const value = arguments orelse {
+        try writeInvalidRequest(writer, "file_search requires arguments");
+        return null;
+    };
+    return switch (value) {
+        .object => |object| blk: {
+            if (!hasOnlyFields(object, &.{ "path", "query", "glob", "maxResults" })) {
+                try writeInvalidRequest(writer, "Invalid file_search arguments");
+                break :blk null;
+            }
+            const path = if (object.get("path") != null)
+                getString(object, "path") orelse {
+                    try writeInvalidRequest(writer, "path must be a string");
+                    break :blk null;
+                }
+            else
+                ".";
+            const query = getString(object, "query") orelse {
+                try writeInvalidRequest(writer, "query must be a string");
+                break :blk null;
+            };
+            const glob = if (object.get("glob") != null)
+                getString(object, "glob") orelse {
+                    try writeInvalidRequest(writer, "glob must be a string");
+                    break :blk null;
+                }
+            else
+                null;
+            if (path.len == 0 or query.len == 0) {
+                try writeInvalidRequest(writer, "path and query must not be empty");
+                break :blk null;
+            }
+            if (glob) |pattern| {
+                if (pattern.len == 0) {
+                    try writeInvalidRequest(writer, "glob must not be empty");
+                    break :blk null;
+                }
+            }
+            const max_results = try parseOptionalPositiveUsize(
+                object,
+                "maxResults",
+                filesystem.default_search_results,
+                filesystem.max_search_results,
+                writer,
+            ) orelse break :blk null;
+            break :blk .{
+                .path = path,
+                .query = query,
+                .glob = glob,
+                .max_results = max_results,
+            };
+        },
+        else => blk: {
+            try writeInvalidRequest(writer, "arguments must be an object");
+            break :blk null;
+        },
+    };
+}
+
+fn parseFilePatchInput(
+    arguments: ?std.json.Value,
+    writer: *std.Io.Writer,
+) !?filesystem.PatchInput {
+    const value = arguments orelse {
+        try writeInvalidRequest(writer, "file_patch requires arguments");
+        return null;
+    };
+    return switch (value) {
+        .object => |object| blk: {
+            if (!hasOnlyFields(object, &.{ "path", "patch" })) {
+                try writeInvalidRequest(writer, "Invalid file_patch arguments");
+                break :blk null;
+            }
+            const path = getString(object, "path") orelse {
+                try writeInvalidRequest(writer, "path must be a string");
+                break :blk null;
+            };
+            const patch_text = getString(object, "patch") orelse {
+                try writeInvalidRequest(writer, "patch must be a string");
+                break :blk null;
+            };
+            if (path.len == 0 or patch_text.len == 0) {
+                try writeInvalidRequest(writer, "path and patch must not be empty");
+                break :blk null;
+            }
+            if (patch_text.len > filesystem.max_write_bytes) {
+                try writeInvalidRequest(writer, "patch exceeds the maximum size");
+                break :blk null;
+            }
+            break :blk .{ .path = path, .patch = patch_text };
         },
         else => blk: {
             try writeInvalidRequest(writer, "arguments must be an object");
