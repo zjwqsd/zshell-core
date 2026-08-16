@@ -1,35 +1,38 @@
 const std = @import("std");
 const zshell = @import("root.zig");
+const tui = @import("tui/app.zig");
+const attach = @import("tui/attach.zig");
+
+var log_io: ?std.Io = null;
+
+pub const std_options: std.Options = .{
+    .logFn = eventLog,
+};
 
 pub fn main(init: std.process.Init) !void {
     zshell.runtime.session_process.runIfRequested(init);
+    log_io = init.io;
 
     const browser_enabled = try parseBrowserOption(init);
-
     zshell.tools.browser.init(init.gpa, init.io, init.environ_map, browser_enabled) catch |err| {
-        switch (err) {
-            error.AgentBrowserNotFound => std.log.err(
-                "browser feature requested, but agent-browser was not found; install agent-browser or start without --browser",
-                .{},
-            ),
-            error.ChromeNotFound => std.log.err(
-                "browser feature requested, but Google Chrome/Chromium was not found; install Chrome or start without --browser",
-                .{},
-            ),
-            else => {},
-        }
+        zshell.control.events.record(
+            init.io,
+            .system,
+            "browser.init_failed",
+            .shellcore,
+            null,
+            @errorName(err),
+        );
         return err;
     };
     defer zshell.tools.browser.deinit();
 
     if (browser_enabled) {
         const status = zshell.tools.browser.status();
-        std.log.info("browser feature enabled: agent-browser={s}, browser={s}", .{
-            status.agentBrowserExecutable orelse "unknown",
-            status.browserExecutable orelse "unknown",
-        });
+        const message = status.agentBrowserExecutable orelse "agent-browser";
+        zshell.control.events.record(init.io, .system, "browser.enabled", .shellcore, null, message);
     } else {
-        std.log.info("browser feature disabled; start with --browser to enable it", .{});
+        zshell.control.events.record(init.io, .system, "browser.disabled", .shellcore, null, "browser feature disabled");
     }
 
     try zshell.tools.jobs.init(init.gpa, init.io, init.environ_map);
@@ -38,14 +41,53 @@ pub fn main(init: std.process.Init) !void {
     try zshell.tools.shells.init(init.gpa, init.io, init.environ_map);
     defer zshell.tools.shells.deinit();
 
-    const human_thread = try std.Thread.spawn(
+    const gateway_thread = try std.Thread.spawn(
         .{},
-        humanControlMain,
-        .{ init.gpa, init.io },
+        gatewayMain,
+        .{ init.gpa, init.io, init.environ_map },
     );
-    human_thread.detach();
+    defer {
+        zshell.device.client.requestStop(init.io);
+        gateway_thread.join();
+    }
 
-    try zshell.device.client.run(init.gpa, init.io, init.environ_map);
+    zshell.control.events.record(init.io, .system, "shellcore.tui_started", .shellcore, null, "terminal UI started");
+
+    while (true) {
+        const action = try tui.run(init.gpa, init.io, init.environ_map);
+        switch (action) {
+            .quit => return,
+            .attach => |shell_id| {
+                attach.run(init.gpa, init.io, init.environ_map, shell_id) catch |err| {
+                    zshell.control.events.record(
+                        init.io,
+                        .system,
+                        "shell.attach_failed",
+                        .shell,
+                        shell_id,
+                        @errorName(err),
+                    );
+                };
+            },
+        }
+    }
+}
+
+fn gatewayMain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+) void {
+    zshell.device.client.run(allocator, io, environ_map) catch |err| {
+        zshell.control.events.record(
+            io,
+            .system,
+            "shellcore.gateway_stopped",
+            .shellcore,
+            null,
+            @errorName(err),
+        );
+    };
 }
 
 fn parseBrowserOption(init: std.process.Init) !bool {
@@ -70,25 +112,28 @@ fn parseBrowserOption(init: std.process.Init) !bool {
             no_browser_seen = true;
             continue;
         }
-
-        std.log.err("unknown command-line argument: {s}", .{arg});
         return error.UnknownCommandLineArgument;
     }
 
     return enabled;
 }
 
-fn humanControlMain(allocator: std.mem.Allocator, io: std.Io) void {
-    zshell.control.server.serve(allocator, io) catch |err| {
-        std.log.err("human control server stopped: {s}", .{@errorName(err)});
-        _ = zshell.control.state.take(io);
-        zshell.control.events.record(
-            io,
-            .system,
-            "control.server_failed",
-            .control,
-            null,
-            @errorName(err),
-        );
+fn eventLog(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const io = log_io orelse return;
+    _ = scope;
+
+    var buffer: [zshell.control.events.message_capacity]u8 = undefined;
+    const message = std.fmt.bufPrint(&buffer, format, args) catch "std.log message exceeded event buffer";
+    const kind = switch (message_level) {
+        .err => "log.error",
+        .warn => "log.warning",
+        .info => "log.info",
+        .debug => "log.debug",
     };
+    zshell.control.events.record(io, .system, kind, .shellcore, null, message);
 }

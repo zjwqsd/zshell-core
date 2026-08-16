@@ -19,7 +19,8 @@
 | tools/*                      exec / env / files        |
 | jobs/*                       direct background jobs    |
 | shells/*                     PTY / ConPTY terminals    |
-| control/*                    local Human Control       |
+| control/*                    Human Control + events   |
+| tui/*                        libvaxis UI + PTY attach  |
 +--------------------------------------------------------+
 ```
 
@@ -33,16 +34,17 @@ Every Core instance requires `ZSHELL_DEVICE_NAME`. The name is the gateway routi
 
 ## Lifecycle
 
-1. initialize job and interactive-terminal managers
-2. bind Human Control to the first free loopback port in `8766..8799`
-3. read `ZSHELL_GATEWAY_URL`, `ZSHELL_DEVICE_TOKEN` and `ZSHELL_DEVICE_NAME`
-4. open a WebSocket to `/device/ws`
-5. authenticate the Upgrade request with the device token
-6. send the protocol-v3 hello containing device metadata
-7. receive text calls/transfer controls and binary transfer chunks
-8. dispatch normal calls locally; stream transfer chunks directly to/from files
-9. return results and transfer state on the same WebSocket
-10. on disconnect, wait two seconds and reconnect
+1. initialize browser (optional), job and interactive-terminal managers
+2. start the outbound Gateway client on a worker thread
+3. start the libvaxis/vxfw terminal UI on the local terminal
+4. read `ZSHELL_GATEWAY_URL`, `ZSHELL_DEVICE_TOKEN` and `ZSHELL_DEVICE_NAME`
+5. open a WebSocket to `/device/ws`
+6. authenticate the Upgrade request with the device token
+7. send the protocol-v3 hello containing device metadata
+8. receive text calls/transfer controls and binary transfer chunks
+9. dispatch normal calls locally; stream transfer chunks directly to/from files
+10. return results and transfer state on the same WebSocket
+11. on disconnect, wait two seconds and reconnect; on local TUI quit, interrupt and join the Gateway client
 
 ## Transport security
 

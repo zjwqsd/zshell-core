@@ -131,6 +131,11 @@ pub const Connection = struct {
         try self.writeFrame(.binary, payload);
     }
 
+    /// Wake a blocked read without taking ownership away from deinit().
+    pub fn interrupt(self: *Connection) void {
+        self.connection.stream_reader.stream.shutdown(self.io, .both) catch {};
+    }
+
     const Opcode = enum(u4) {
         continuation = 0,
         text = 1,

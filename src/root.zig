@@ -36,12 +36,10 @@ pub const executions = struct {
 pub const control = struct {
     pub const state = @import("control/state.zig");
     pub const events = @import("control/events.zig");
-    pub const server = @import("control/server.zig");
 };
 
 pub const runtime = struct {
     pub const source = @import("runtime/source.zig");
-    pub const ports = @import("runtime/ports.zig");
     pub const secrets = @import("runtime/secrets.zig");
     pub const session_process = @import("runtime/session_process.zig");
     pub const terminal = @import("runtime/terminal.zig");

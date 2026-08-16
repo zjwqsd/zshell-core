@@ -114,6 +114,11 @@ pub const ListResult = struct {
     }
 };
 
+pub const OutputOffsets = struct {
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+};
+
 pub const LookupError = error{ShellNotFound};
 pub const Error = LookupError || error{ShellNotRunning};
 
@@ -319,6 +324,18 @@ pub const Manager = struct {
     }
 
     pub fn write(self: *Manager, shell_id: ShellId, input: []const u8, enter: bool) !WriteResult {
+        return self.writeBy(shell_id, input, enter, .agent);
+    }
+
+    pub fn writeAttached(self: *Manager, shell_id: ShellId, input: []const u8) !WriteResult {
+        return self.writeInternal(shell_id, input, false, null);
+    }
+
+    pub fn writeBy(self: *Manager, shell_id: ShellId, input: []const u8, enter: bool, source: Source) !WriteResult {
+        return self.writeInternal(shell_id, input, enter, source);
+    }
+
+    fn writeInternal(self: *Manager, shell_id: ShellId, input: []const u8, enter: bool, source: ?Source) !WriteResult {
         const shell = try self.getShell(shell_id);
         shell.mutex.lockUncancelable(shell.io);
         const running = shell.status == .running and shell.stop_requested == null;
@@ -334,7 +351,9 @@ pub const Manager = struct {
         // it to newline; ConPTY accepts it as the normal Enter input sequence.
         if (enter) try shell.input.writeStreamingAll(shell.io, "\r");
 
-        events.record(self.io, .agent, "shell.write", .shell, shell_id, input);
+        if (source) |event_source| {
+            events.record(self.io, event_source, "shell.write", .shell, shell_id, input);
+        }
         return .{ .shell_id = shell_id, .sent_bytes = input.len, .enter = enter };
     }
 
@@ -414,6 +433,16 @@ pub const Manager = struct {
             .termination = shell.termination,
             .worker_error = shell.worker_error,
             .termination_source = shell.termination_source,
+        };
+    }
+
+    pub fn outputOffsets(self: *Manager, shell_id: ShellId) LookupError!OutputOffsets {
+        const shell = try self.getShell(shell_id);
+        shell.mutex.lockUncancelable(shell.io);
+        defer shell.mutex.unlock(shell.io);
+        return .{
+            .stdout_bytes = shell.stdout.total_bytes,
+            .stderr_bytes = shell.stderr.total_bytes,
         };
     }
 

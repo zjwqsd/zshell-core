@@ -10,6 +10,44 @@ const websocket = @import("websocket_client.zig");
 const protocol_version: u32 = 3;
 const reconnect_delay_seconds: i64 = 2;
 
+var lifecycle_mutex: std.Io.Mutex = .init;
+var stop_requested: bool = false;
+var active_connection: ?*websocket.Connection = null;
+
+pub fn requestStop(io: std.Io) void {
+    lifecycle_mutex.lockUncancelable(io);
+    defer lifecycle_mutex.unlock(io);
+    stop_requested = true;
+    if (active_connection) |connection| connection.interrupt();
+}
+
+fn resetStop(io: std.Io) void {
+    lifecycle_mutex.lockUncancelable(io);
+    defer lifecycle_mutex.unlock(io);
+    stop_requested = false;
+    active_connection = null;
+}
+
+fn shouldStop(io: std.Io) bool {
+    lifecycle_mutex.lockUncancelable(io);
+    defer lifecycle_mutex.unlock(io);
+    return stop_requested;
+}
+
+fn setActiveConnection(io: std.Io, connection: ?*websocket.Connection) bool {
+    lifecycle_mutex.lockUncancelable(io);
+    defer lifecycle_mutex.unlock(io);
+    if (stop_requested) return false;
+    active_connection = connection;
+    return true;
+}
+
+fn clearActiveConnection(io: std.Io, connection: *websocket.Connection) void {
+    lifecycle_mutex.lockUncancelable(io);
+    defer lifecycle_mutex.unlock(io);
+    if (active_connection == connection) active_connection = null;
+}
+
 const Config = struct {
     gateway_url: []const u8,
     token: []const u8,
@@ -52,15 +90,15 @@ pub fn run(
     environ_map: anytype,
 ) !void {
     const config = try Config.load(environ_map);
-
-    std.log.info("zshell ShellCore WebSocket gateway: {s}", .{config.gateway_url});
+    resetStop(io);
+    events.record(io, .system, "shellcore.gateway_configured", .shellcore, null, config.gateway_url);
     if (std.mem.startsWith(u8, config.gateway_url, "ws://")) {
-        std.log.warn("ShellCore is using unencrypted ws:// transport; use this only on a trusted LAN", .{});
+        events.record(io, .system, "shellcore.gateway_insecure", .shellcore, null, "unencrypted ws:// transport");
     }
 
-    while (true) {
+    while (!shouldStop(io)) {
         connectAndServe(allocator, io, config) catch |err| {
-            std.log.warn("ShellCore WebSocket session ended: {s}", .{@errorName(err)});
+            if (shouldStop(io)) return;
             events.record(
                 io,
                 .system,
@@ -70,6 +108,7 @@ pub fn run(
                 @errorName(err),
             );
         };
+        if (shouldStop(io)) return;
         try io.sleep(.fromSeconds(reconnect_delay_seconds), .awake);
     }
 }
@@ -81,6 +120,8 @@ fn connectAndServe(
 ) !void {
     var socket = try websocket.Connection.connect(allocator, io, config.gateway_url, config.token);
     defer socket.deinit();
+    if (!setActiveConnection(io, &socket)) return error.StopRequested;
+    defer clearActiveConnection(io, &socket);
 
     try sendHello(allocator, io, &socket, config);
 
@@ -96,12 +137,11 @@ fn connectAndServe(
 
     if (!std.mem.eql(u8, ack.value.type, "hello_ack") or !ack.value.accepted) {
         if (ack.value.message) |message| {
-            std.log.err("gateway rejected ShellCore: {s}", .{message});
+            events.record(io, .system, "shellcore.gateway_rejected", .shellcore, null, message);
         }
         return error.GatewayRejected;
     }
 
-    std.log.info("ShellCore connected to WebSocket gateway {s}", .{config.gateway_url});
     events.record(
         io,
         .system,
@@ -123,7 +163,7 @@ fn connectAndServe(
 
         if (frame.kind == .binary) {
             transfers.handleBinary(frame.payload) catch |err| {
-                std.log.warn("ignored invalid or stale transfer frame: {s}", .{@errorName(err)});
+                events.record(io, .system, "transfer.frame_rejected", .shellcore, null, @errorName(err));
             };
             continue;
         }

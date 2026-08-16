@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
         .name = "zshell-core",
@@ -12,6 +13,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -26,6 +28,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    unit_tests.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);

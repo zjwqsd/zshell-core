@@ -12,7 +12,7 @@ ShellCore contains the operating-system execution capabilities and connects outb
 - read/write files
 - stream files between ShellCore devices through Gateway
 - report environment information
-- provide local Human Control on loopback ports starting at `8766`
+- provide a local libvaxis TUI for monitoring and Human Control
 - connect outbound to `/device/ws`
 - declare its own device name and workspace
 - reconnect automatically after transport loss
@@ -40,9 +40,26 @@ ZSHELL_GATEWAY_URL=ws://192.168.1.20:8765/device/ws
 
 ## Build
 
+Requires Zig 0.16.0 or newer. Dependencies such as libvaxis are declared in `build.zig.zon` and are fetched automatically on the first build; generated dependency/cache directories such as `zig-pkg/`, `.zig-cache/` and `zig-out/` are not part of the repository.
+
+A fresh checkout can be built directly:
+
 ```bash
-zig build -Doptimize=ReleaseSafe
+git clone git@github.com:zjwqsd/zshell-core.git
+cd zshell-core
+zig build -Doptimize=ReleaseSmall
 ```
+
+`ReleaseSmall` is the recommended mode for binaries that will be copied to other machines. On the tested x86_64 Linux build it produces a self-contained binary of roughly 1.8 MiB.
+
+For development and tests:
+
+```bash
+zig build
+zig build test
+```
+
+Use `-Doptimize=ReleaseSafe` instead when you prefer additional runtime safety checks over minimum binary size.
 
 ## Run
 
@@ -103,14 +120,24 @@ The source reads the file in 256 KiB chunks and computes SHA-256 while streaming
 
 The target side is a mutating action and obeys Human Control: a new transfer is rejected while the human owns execution control. Running transfers are left unchanged, matching the behavior of existing running jobs and executions.
 
-## Human Control
+## Terminal UI and Human Control
 
-Human Control remains local and independent of the gateway. The first Core normally binds:
+ShellCore runs a local libvaxis/vxfw terminal UI. It does not open a local HTTP control port. The dashboard shows exec, job and shell activity together with recent events and selected-resource details.
+
+Keyboard controls:
 
 ```text
-http://127.0.0.1:8766
+j/k       move selection
+Enter     open/close detail
+/         filter resources
+t         toggle Agent/Human Control
+x         terminate exec / stop job / kill shell (Human Control)
+a         attach to a running shell (Human Control)
+q         stop ShellCore
 ```
 
-Additional Core instances choose the next available loopback port through `8799`.
+Shell attach connects the local terminal to the existing PTY/ConPTY session. Press `Ctrl+]` to detach and return to the dashboard without killing the shell.
 
-Stopping `zshell-core` immediately closes the device transport; the gateway then removes it from the live registry.
+While Human Control is active, mutating agent operations remain blocked by the existing control-state checks. Runtime logs and important lifecycle state are surfaced through the Events view so terminal output does not corrupt the TUI.
+
+Stopping `zshell-core` closes the device transport; the gateway then removes it from the live registry.

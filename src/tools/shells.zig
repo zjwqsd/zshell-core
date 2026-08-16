@@ -12,6 +12,7 @@ pub const ReadResult = manager.ReadResult;
 pub const KillResult = manager.KillResult;
 pub const ListItem = manager.ListItem;
 pub const ListResult = manager.ListResult;
+pub const OutputOffsets = manager.OutputOffsets;
 pub const backend_name = manager.backend_name;
 
 var global_manager: ?manager.Manager = null;
@@ -40,6 +41,19 @@ pub fn write(
     return getManager().write(shell_id, input, enter);
 }
 
+pub fn writeBy(
+    shell_id: ShellId,
+    input: []const u8,
+    enter: bool,
+    source: Source,
+) !WriteResult {
+    return getManager().writeBy(shell_id, input, enter, source);
+}
+
+pub fn writeAttached(shell_id: ShellId, input: []const u8) !WriteResult {
+    return getManager().writeAttached(shell_id, input);
+}
+
 pub fn resize(shell_id: ShellId, cols: u16, rows: u16) !ResizeResult {
     return getManager().resize(shell_id, cols, rows);
 }
@@ -63,6 +77,10 @@ pub fn killBy(shell_id: ShellId, source: Source) manager.LookupError!KillResult 
 
 pub fn list(allocator: std.mem.Allocator) !ListResult {
     return getManager().list(allocator);
+}
+
+pub fn outputOffsets(shell_id: ShellId) manager.LookupError!OutputOffsets {
+    return getManager().outputOffsets(shell_id);
 }
 
 fn getManager() *manager.Manager {

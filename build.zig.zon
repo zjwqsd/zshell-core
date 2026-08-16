@@ -1,0 +1,13 @@
+.{
+    .name = .zshell_core,
+    .fingerprint = 0xd66ee39a4a59d858,
+    .version = "0.2.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis#6cab03f8a3faeb58bddf334343889a7f685ba7a7",
+            .hash = "vaxis-0.6.0-BWNV_FcoCgB3Q_LTiQet_GeS23Bd7e224eHloS8PanKZ",
+        },
+    },
+    .paths = .{""},
+}
