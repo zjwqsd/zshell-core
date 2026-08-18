@@ -804,3 +804,59 @@ test "PTY can start zsh explicitly" {
     try std.testing.expectEqual(Status.exited, result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "__ZSH_") != null);
 }
+
+test "ConPTY shell is interactive persistent and resizable" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var environment = try std.testing.environ.createMap(allocator);
+    defer environment.deinit();
+
+    var manager = try Manager.init(allocator, std.testing.io, &environment);
+    defer manager.deinit();
+
+    const started = try manager.start(.{
+        .shell = "powershell.exe",
+        .args = &.{ "-NoLogo", "-NoProfile" },
+        .cols = 80,
+        .rows = 24,
+    });
+    try std.testing.expectEqualStrings("conpty", started.backend);
+
+    _ = try manager.write(started.shell_id, "Write-Output '__CONPTY_OK__'", true);
+    _ = try manager.write(started.shell_id, "$env:ZSHELL_CONPTY_STATE='works'", true);
+    _ = try manager.write(started.shell_id, "Write-Output \"__STATE_$env:ZSHELL_CONPTY_STATE__\"", true);
+    const resized = try manager.resize(started.shell_id, 100, 40);
+    try std.testing.expectEqual(@as(u16, 100), resized.cols);
+    try std.testing.expectEqual(@as(u16, 40), resized.rows);
+
+    var saw_output = false;
+    for (0..100) |_| {
+        const current = try manager.read(allocator, started.shell_id, null, null);
+        defer current.deinit(allocator);
+        if (std.mem.indexOf(u8, current.stdout, "__CONPTY_OK__") != null and
+            std.mem.indexOf(u8, current.stdout, "__STATE_works__") != null)
+        {
+            try std.testing.expectEqual(Status.running, current.status);
+            try std.testing.expectEqual(@as(u16, 100), current.cols);
+            try std.testing.expectEqual(@as(u16, 40), current.rows);
+            saw_output = true;
+            break;
+        }
+        if (current.status != .running) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try std.testing.expect(saw_output);
+
+    _ = try manager.write(started.shell_id, "exit", true);
+    for (0..100) |_| {
+        const current = try manager.read(allocator, started.shell_id, null, null);
+        defer current.deinit(allocator);
+        if (current.status != .running) {
+            try std.testing.expectEqual(Status.exited, current.status);
+            return;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.TestUnexpectedResult;
+}

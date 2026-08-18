@@ -374,6 +374,7 @@ const Windows = if (builtin.os.tag == .windows) struct {
         defer windows.CloseHandle(device);
 
         var server: windows.HANDLE = undefined;
+        var default_timeout: windows.LARGE_INTEGER = -120 * std.time.ns_per_s / 100;
         const create_status = windows.ntdll.NtCreateNamedPipeFile(
             &server,
             .{
@@ -382,7 +383,7 @@ const Windows = if (builtin.os.tag == .windows) struct {
                     .WRITE_DATA = outbound,
                     .WRITE_ATTRIBUTES = true,
                 } },
-                .STANDARD = .{ .SYNCHRONIZE = !async_server },
+                .STANDARD = .{ .SYNCHRONIZE = true },
             },
             &.{ .RootDirectory = device },
             &iosb,
@@ -395,7 +396,7 @@ const Windows = if (builtin.os.tag == .windows) struct {
             1,
             if (inbound) 4096 else 0,
             if (outbound) 4096 else 0,
-            null,
+            &default_timeout,
         );
         if (create_status != .SUCCESS) return error.WindowsPipeFailed;
         errdefer windows.CloseHandle(server);
@@ -445,8 +446,8 @@ fn spawnWindows(
     var hpcon_owned = true;
     errdefer if (hpcon_owned) Windows.ClosePseudoConsole(hpcon);
 
-    // ConPTY owns the client ends after creation; the host keeps only the
-    // opposite ends used by shell_write/shell_read.
+    // CreatePseudoConsole duplicates these handles into the console host. The
+    // host keeps the opposite ends used by shell_write/shell_read.
     windows.CloseHandle(input_pipe[1]);
     windows.CloseHandle(output_pipe[1]);
 
@@ -461,12 +462,11 @@ fn spawnWindows(
     }
     defer Windows.DeleteProcThreadAttributeList(attr_list);
 
-    var hpcon_value = hpcon;
     if (Windows.UpdateProcThreadAttribute(
         attr_list,
         0,
         Windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        @ptrCast(&hpcon_value),
+        hpcon,
         @sizeOf(Windows.HPCON),
         null,
         null,
@@ -496,7 +496,7 @@ fn spawnWindows(
             .dwXCountChars = 0,
             .dwYCountChars = 0,
             .dwFillAttribute = 0,
-            .dwFlags = 0,
+            .dwFlags = windows.STARTF_USESTDHANDLES,
             .wShowWindow = 0,
             .cbReserved2 = 0,
             .lpReserved2 = null,
