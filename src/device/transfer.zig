@@ -1,17 +1,16 @@
 const std = @import("std");
-const websocket = @import("websocket_client.zig");
+const transport = @import("transport.zig");
 const control = @import("../control/state.zig");
 
-pub const chunk_size: usize = 256 * 1024;
-pub const binary_magic = "ZTF1";
-pub const binary_header_size: usize = binary_magic.len + 16 + 8;
+pub const binary_magic = transport.binary_magic;
+pub const binary_header_size = transport.binary_header_size;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const SourceState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    socket: *websocket.Connection,
+    transport: *transport.DeviceTransport,
     id: [16]u8,
     id_text: [32]u8,
     path: []u8,
@@ -57,16 +56,16 @@ const TargetState = struct {
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    socket: *websocket.Connection,
+    transport: *transport.DeviceTransport,
     mutex: std.Io.Mutex = .init,
     source: ?*SourceState = null,
     target: ?*TargetState = null,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, socket: *websocket.Connection) Manager {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, device_transport: *transport.DeviceTransport) Manager {
         return .{
             .allocator = allocator,
             .io = io,
-            .socket = socket,
+            .transport = device_transport,
         };
     }
 
@@ -161,7 +160,7 @@ pub const Manager = struct {
         return error.UnsupportedTransferMessage;
     }
 
-    pub fn handleBinary(self: *Manager, frame: []const u8) !void {
+    pub fn handleBinary(self: *Manager, frame: []const u8) !bool {
         if (frame.len < binary_header_size) return error.InvalidTransferFrame;
         if (!std.mem.eql(u8, frame[0..binary_magic.len], binary_magic)) return error.InvalidTransferFrame;
 
@@ -174,18 +173,18 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         const state = self.target orelse {
             self.mutex.unlock(self.io);
-            return;
+            return false;
         };
         if (!std.mem.eql(u8, &state.id, &id)) {
             self.mutex.unlock(self.io);
-            return;
+            return false;
         }
         if (sequence != state.next_sequence) {
             const id_text = state.id_text;
             self.mutex.unlock(self.io);
             self.dropTarget(&id_text, true);
             try self.sendFailure(&id_text, "target", error.TransferSequenceMismatch);
-            return;
+            return false;
         }
 
         const offset = state.bytes_written;
@@ -194,12 +193,13 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             self.dropTarget(&id_text, true);
             try self.sendFailure(&id_text, "target", err);
-            return;
+            return false;
         };
         state.hasher.update(payload);
         state.bytes_written += @intCast(payload.len);
         state.next_sequence += 1;
         self.mutex.unlock(self.io);
+        return true;
     }
 
     fn prepareSource(self: *Manager, id_text: []const u8, path: []const u8) !void {
@@ -217,7 +217,7 @@ pub const Manager = struct {
         state.* = .{
             .allocator = self.allocator,
             .io = self.io,
-            .socket = self.socket,
+            .transport = self.transport,
             .id = id,
             .id_text = std.fmt.bytesToHex(id, .lower),
             .path = owned_path,
@@ -457,7 +457,7 @@ pub const Manager = struct {
         var payload: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload.deinit();
         try payload.writer.print("{f}", .{std.json.fmt(value, .{})});
-        try self.socket.writeText(payload.written());
+        try self.transport.writeText(payload.written());
     }
 };
 
@@ -475,7 +475,7 @@ fn sourceWorker(state: *SourceState) !void {
     });
     defer file.close(state.io);
 
-    var buffer = try state.allocator.alloc(u8, chunk_size);
+    var buffer = try state.allocator.alloc(u8, state.transport.transferChunkSize());
     defer state.allocator.free(buffer);
     var hasher = Sha256.init(.{});
     var offset: u64 = 0;
@@ -488,20 +488,13 @@ fn sourceWorker(state: *SourceState) !void {
         }
 
         const remaining = state.size - offset;
-        const wanted: usize = @intCast(@min(remaining, @as(u64, chunk_size)));
+        const wanted: usize = @intCast(@min(remaining, @as(u64, state.transport.transferChunkSize())));
         const count = try file.readPositionalAll(state.io, buffer[0..wanted], offset);
         if (count != wanted) return error.TransferSourceChanged;
         const chunk = buffer[0..count];
         hasher.update(chunk);
 
-        const frame = try state.allocator.alloc(u8, binary_header_size + count);
-        defer state.allocator.free(frame);
-        @memcpy(frame[0..binary_magic.len], binary_magic);
-        @memcpy(frame[binary_magic.len .. binary_magic.len + state.id.len], &state.id);
-        const sequence_offset = binary_magic.len + state.id.len;
-        std.mem.writeInt(u64, frame[sequence_offset .. sequence_offset + 8], sequence, .big);
-        @memcpy(frame[binary_header_size..], chunk);
-        try state.socket.writeBinary(frame);
+        try state.transport.sendTransferChunk(state.id, sequence, chunk);
 
         offset += @intCast(count);
         sequence += 1;
@@ -546,7 +539,7 @@ fn sendSourceJson(state: *SourceState, value: anytype) !void {
     var payload: std.Io.Writer.Allocating = .init(state.allocator);
     defer payload.deinit();
     try payload.writer.print("{f}", .{std.json.fmt(value, .{})});
-    try state.socket.writeText(payload.written());
+    try state.transport.writeText(payload.written());
 }
 
 pub fn parseTransferId(text: []const u8) ![16]u8 {

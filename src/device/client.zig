@@ -5,14 +5,14 @@ const dispatcher = @import("../protocol/dispatcher.zig");
 const events = @import("../control/events.zig");
 const version = @import("../version.zig");
 const transfer = @import("transfer.zig");
-const websocket = @import("websocket_client.zig");
+const transport = @import("transport.zig");
 
 const protocol_version: u32 = 3;
 const reconnect_delay_seconds: i64 = 2;
 
 var lifecycle_mutex: std.Io.Mutex = .init;
 var stop_requested: bool = false;
-var active_connection: ?*websocket.Connection = null;
+var active_connection: ?*transport.DeviceTransport = null;
 
 pub fn requestStop(io: std.Io) void {
     lifecycle_mutex.lockUncancelable(io);
@@ -34,7 +34,7 @@ fn shouldStop(io: std.Io) bool {
     return stop_requested;
 }
 
-fn setActiveConnection(io: std.Io, connection: ?*websocket.Connection) bool {
+fn setActiveConnection(io: std.Io, connection: ?*transport.DeviceTransport) bool {
     lifecycle_mutex.lockUncancelable(io);
     defer lifecycle_mutex.unlock(io);
     if (stop_requested) return false;
@@ -42,7 +42,7 @@ fn setActiveConnection(io: std.Io, connection: ?*websocket.Connection) bool {
     return true;
 }
 
-fn clearActiveConnection(io: std.Io, connection: *websocket.Connection) void {
+fn clearActiveConnection(io: std.Io, connection: *transport.DeviceTransport) void {
     lifecycle_mutex.lockUncancelable(io);
     defer lifecycle_mutex.unlock(io);
     if (active_connection == connection) active_connection = null;
@@ -52,10 +52,12 @@ const Config = struct {
     gateway_url: []const u8,
     token: []const u8,
     device_name: []const u8,
+    transport_kind: transport.Kind,
 
     fn load(environ_map: anytype) !Config {
         const gateway_url = environ_map.get("ZSHELL_GATEWAY_URL") orelse return error.MissingGatewayURL;
         if (!isAllowedGatewayURL(gateway_url)) return error.InvalidGatewayURL;
+        const transport_kind = try transport.DeviceTransport.kindForURL(gateway_url);
 
         const token = environ_map.get("ZSHELL_DEVICE_TOKEN") orelse return error.MissingDeviceToken;
         if (token.len < 24 or token.len > 512) return error.InvalidDeviceToken;
@@ -67,6 +69,7 @@ const Config = struct {
             .gateway_url = gateway_url,
             .token = token,
             .device_name = device_name,
+            .transport_kind = transport_kind,
         };
     }
 };
@@ -91,9 +94,14 @@ pub fn run(
 ) !void {
     const config = try Config.load(environ_map);
     resetStop(io);
+
+    const transport_name = @tagName(config.transport_kind);
+    std.log.info("zshell transport: {s}", .{transport_name});
+    std.log.info("zshell gateway: {s}", .{config.gateway_url});
+    events.record(io, .system, "shellcore.transport", .shellcore, null, transport_name);
     events.record(io, .system, "shellcore.gateway_configured", .shellcore, null, config.gateway_url);
-    if (std.mem.startsWith(u8, config.gateway_url, "ws://")) {
-        events.record(io, .system, "shellcore.gateway_insecure", .shellcore, null, "unencrypted ws:// transport");
+    if (std.mem.startsWith(u8, config.gateway_url, "ws://") or std.mem.startsWith(u8, config.gateway_url, "http://")) {
+        events.record(io, .system, "shellcore.gateway_insecure", .shellcore, null, "unencrypted gateway transport");
     }
 
     while (!shouldStop(io)) {
@@ -118,19 +126,20 @@ fn connectAndServe(
     io: std.Io,
     config: Config,
 ) !void {
-    var socket = try websocket.Connection.connect(allocator, io, config.gateway_url, config.token);
-    defer socket.deinit();
-    if (!setActiveConnection(io, &socket)) return error.StopRequested;
-    defer clearActiveConnection(io, &socket);
+    var connection = try transport.DeviceTransport.connect(allocator, io, config.gateway_url, config.token);
+    defer connection.deinit();
+    if (!setActiveConnection(io, &connection)) return error.StopRequested;
+    defer clearActiveConnection(io, &connection);
 
-    try sendHello(allocator, io, &socket, config);
+    try sendHello(allocator, io, &connection, config);
 
-    const ack_text = try socket.readText();
-    defer allocator.free(ack_text);
+    const ack_message = try connection.readMessage(allocator);
+    defer allocator.free(ack_message.payload);
+    if (ack_message.kind != .text) return error.ExpectedHelloAck;
     const ack = try std.json.parseFromSlice(
         HelloAck,
         allocator,
-        ack_text,
+        ack_message.payload,
         .{ .ignore_unknown_fields = false },
     );
     defer ack.deinit();
@@ -151,20 +160,20 @@ fn connectAndServe(
         config.gateway_url,
     );
 
-    var connection_writer = ConnectionWriter{
-        .socket = &socket,
-    };
-    var transfers = transfer.Manager.init(allocator, io, &socket);
+    var connection_writer = ConnectionWriter{ .transport = &connection };
+    var transfers = transfer.Manager.init(allocator, io, &connection);
     defer transfers.deinit();
 
     while (true) {
-        const frame = try socket.readMessage();
+        const frame = try connection.readMessage(allocator);
         defer allocator.free(frame.payload);
 
         if (frame.kind == .binary) {
-            transfers.handleBinary(frame.payload) catch |err| {
+            const accepted = transfers.handleBinary(frame.payload) catch |err| accepted: {
                 events.record(io, .system, "transfer.frame_rejected", .shellcore, null, @errorName(err));
+                break :accepted false;
             };
+            try connection.finishReceivedTransferChunk(accepted);
             continue;
         }
         if (try transfers.handleText(frame.payload)) continue;
@@ -211,13 +220,13 @@ fn connectAndServe(
 }
 
 const ConnectionWriter = struct {
-    socket: *websocket.Connection,
+    transport: *transport.DeviceTransport,
 
     fn sendPong(self: *ConnectionWriter, allocator: std.mem.Allocator, id: u64) !void {
         var payload: std.Io.Writer.Allocating = .init(allocator);
         defer payload.deinit();
         try payload.writer.print("{f}", .{std.json.fmt(.{ .type = "pong", .id = id }, .{})});
-        try self.socket.writeText(payload.written());
+        try self.transport.writeText(payload.written());
     }
 
     fn sendResult(
@@ -233,14 +242,14 @@ const ConnectionWriter = struct {
         try payload.writer.writeAll(",\"payload\":");
         try payload.writer.writeAll(result);
         try payload.writer.writeAll("}");
-        try self.socket.writeText(payload.written());
+        try self.transport.writeText(payload.written());
     }
 };
 
 fn sendHello(
     allocator: std.mem.Allocator,
     io: std.Io,
-    socket: *websocket.Connection,
+    connection: *transport.DeviceTransport,
     config: Config,
 ) !void {
     const workspace = try std.process.currentPathAlloc(io, allocator);
@@ -259,11 +268,12 @@ fn sendHello(
             .version = version.value,
         },
     }, .{})});
-    try socket.writeText(payload.written());
+    try connection.writeText(payload.written());
 }
 
 fn isAllowedGatewayURL(value: []const u8) bool {
-    if (std.mem.startsWith(u8, value, "wss://")) return value.len > "wss://".len;
-    if (std.mem.startsWith(u8, value, "ws://")) return value.len > "ws://".len;
+    inline for (.{ "wss://", "ws://", "https://", "http://" }) |prefix| {
+        if (std.mem.startsWith(u8, value, prefix)) return value.len > prefix.len;
+    }
     return false;
 }

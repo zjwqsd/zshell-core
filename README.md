@@ -2,7 +2,7 @@
 
 Zig execution core for zshell.
 
-ShellCore contains the operating-system execution capabilities and connects outbound to one zshell Gateway over WebSocket. It has no MCP or OAuth server.
+ShellCore contains the operating-system execution capabilities and connects outbound to one zshell Gateway over WebSocket or HTTP transport. It has no MCP or OAuth server.
 
 ## Responsibilities
 
@@ -13,7 +13,7 @@ ShellCore contains the operating-system execution capabilities and connects outb
 - stream files between ShellCore devices through Gateway
 - report environment information
 - provide a local libvaxis TUI for monitoring and Human Control
-- connect outbound to `/device/ws`
+- connect outbound to the Gateway device endpoint using the transport selected by `ZSHELL_GATEWAY_URL`
 - declare its own device name and workspace
 - reconnect automatically after transport loss
 - optionally provide browser automation when started with `--browser`
@@ -28,13 +28,20 @@ ZSHELL_DEVICE_TOKEN=<same 24-512 character device secret as gateway>
 ZSHELL_DEVICE_NAME=<unique name chosen for this Core instance>
 ```
 
-For a trusted LAN you may use:
+Transport selection is determined only by the URL scheme:
 
 ```text
-ZSHELL_GATEWAY_URL=ws://192.168.1.20:8765/device/ws
+ws://, wss://     -> WebSocket
+http://, https:// -> HTTP
 ```
 
-`ws://` is unencrypted, so use it only on a trusted LAN. For public or otherwise untrusted networks use `wss://`.
+For environments where WebSocket is unavailable, use the HTTP device endpoint:
+
+```text
+ZSHELL_GATEWAY_URL=https://zshell.example.com/device/http
+```
+
+For a trusted LAN you may use `ws://.../device/ws` or `http://.../device/http`. The plain-text schemes are unencrypted; use `wss://` or `https://` on untrusted networks. ShellCore does not automatically fall back between transports.
 
 `ZSHELL_DEVICE_NAME` is mandatory. The gateway does not generate or rewrite device names. Multiple Core instances on one physical machine should use different names.
 
@@ -108,15 +115,17 @@ If either dependency is missing, ShellCore exits instead of starting with a part
 
 ## Transport
 
-The WebSocket upgrade includes the device token in the HTTP `Authorization` header. After the upgrade, Core sends its name, workspace, OS, architecture and version as the protocol-v3 hello message.
+Both transports authenticate with the same bearer device token and preserve protocol-v3 message semantics (`hello`/`hello_ack`, `call`/`result`, `ping`/`pong`, transfer control). `ZSHELL_GATEWAY_URL` selects the transport by scheme; there is no separate transport flag or environment variable.
 
-Protocol v3 carries normal calls/results and transfer-control messages as WebSocket text frames. Cross-device file payloads use raw WebSocket binary frames, so file bytes are not base64-encoded and do not pass through the MCP/model context. Client-to-server WebSocket frames are masked as required by RFC 6455, server frames are validated, and individual messages larger than 8 MiB are rejected.
+WebSocket mode keeps the existing wire protocol unchanged, including text control messages, `ZTF1` binary transfer frames, heartbeat behavior and reconnects.
+
+HTTP mode establishes a device session with `POST /device/http`, receives Gateway messages through long polling, and posts results/pongs/control messages back to the session. File bytes use separate `application/octet-stream` endpoints and are never Base64 encoded. HTTP transfer chunks are larger than WebSocket chunks to reduce request overhead.
 
 ## Cross-device file transfer
 
-File transfer is always available; unlike browser automation it does not require a startup flag or external executable. Gateway coordinates a source Core and a target Core over their existing outbound WebSockets.
+File transfer is always available; unlike browser automation it does not require a startup flag or external executable. Gateway can relay between any transport combination: WebSocket -> WebSocket, WebSocket -> HTTP, HTTP -> WebSocket, or HTTP -> HTTP.
 
-The source reads the file in 256 KiB chunks and computes SHA-256 while streaming. Gateway forwards each binary frame directly to the target and does not buffer the whole file. The target writes to `<target>.zshell-part`, computes its own SHA-256, verifies size and hash against the source, then renames the temporary file to the requested destination. Failed or cancelled transfers remove the temporary part file.
+The source computes SHA-256 while streaming. WebSocket sources use the existing 256 KiB `ZTF1` binary frames; HTTP sources currently use 1 MiB raw `application/octet-stream` chunks. Gateway preserves transfer ID and sequence ordering and applies backpressure without buffering the whole file. The target writes to `<target>.zshell-part`, computes its own SHA-256, verifies size and hash against the source, then renames the temporary file to the requested destination. Failed or cancelled transfers remove the temporary part file.
 
 The target side is a mutating action and obeys Human Control: a new transfer is rejected while the human owns execution control. Running transfers are left unchanged, matching the behavior of existing running jobs and executions.
 
