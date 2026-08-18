@@ -56,7 +56,7 @@ The WebSocket client validates the HTTP 101 upgrade and `Sec-WebSocket-Accept`, 
 
 ```text
 source file
-   | read 256 KiB + SHA-256
+   | read 1 MiB + SHA-256
    v
 source Core -- binary WebSocket --> Gateway -- binary WebSocket --> target Core
                                                               |

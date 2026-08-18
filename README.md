@@ -119,13 +119,13 @@ Both transports authenticate with the same bearer device token and preserve prot
 
 WebSocket mode keeps the existing wire protocol unchanged, including text control messages, `ZTF1` binary transfer frames, heartbeat behavior and reconnects.
 
-HTTP mode establishes a device session with `POST /device/http`, receives Gateway messages through long polling, and posts results/pongs/control messages back to the session. File bytes use separate `application/octet-stream` endpoints and are never Base64 encoded. HTTP transfer chunks are larger than WebSocket chunks to reduce request overhead.
+HTTP mode establishes a device session with `POST /device/http`, receives Gateway messages through long polling, and posts results/pongs/control messages back to the session. File bytes use separate `application/octet-stream` endpoints and are never Base64 encoded. HTTP and WebSocket file transfers both use 1 MiB chunks to reduce per-chunk overhead while keeping bounded memory usage.
 
 ## Cross-device file transfer
 
 File transfer is always available; unlike browser automation it does not require a startup flag or external executable. Gateway can relay between any transport combination: WebSocket -> WebSocket, WebSocket -> HTTP, HTTP -> WebSocket, or HTTP -> HTTP.
 
-The source computes SHA-256 while streaming. WebSocket sources use the existing 256 KiB `ZTF1` binary frames; HTTP sources currently use 1 MiB raw `application/octet-stream` chunks. Gateway preserves transfer ID and sequence ordering and applies backpressure without buffering the whole file. The target writes to `<target>.zshell-part`, computes its own SHA-256, verifies size and hash against the source, then renames the temporary file to the requested destination. Failed or cancelled transfers remove the temporary part file.
+The source computes SHA-256 while streaming. WebSocket sources use 1 MiB `ZTF1` binary frames; HTTP sources use 1 MiB raw `application/octet-stream` chunks. Gateway preserves transfer ID and sequence ordering and applies backpressure without buffering the whole file. The target writes to `<target>.zshell-part`, computes its own SHA-256, verifies size and hash against the source, then renames the temporary file to the requested destination. Failed or cancelled transfers remove the temporary part file.
 
 The target side is a mutating action and obeys Human Control: a new transfer is rejected while the human owns execution control. Running transfers are left unchanged, matching the behavior of existing running jobs and executions.
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const websocket = @import("websocket_client.zig");
 const http = @import("http_client.zig");
 
-pub const websocket_chunk_size: usize = 256 * 1024;
+pub const websocket_chunk_size: usize = 1024 * 1024;
 pub const http_chunk_size: usize = 1024 * 1024;
 pub const binary_magic = "ZTF1";
 pub const binary_header_size: usize = binary_magic.len + 16 + 8;
