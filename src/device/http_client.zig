@@ -1,4 +1,6 @@
 const std = @import("std");
+const tls = @import("tls.zig");
+const connect_override = @import("connect_override.zig");
 
 const max_control_message_size: usize = 8 * 1024 * 1024;
 const max_transfer_chunk_size: usize = 4 * 1024 * 1024;
@@ -8,6 +10,8 @@ pub const Connection = struct {
     io: std.Io,
     base_url: []const u8,
     token: []const u8,
+    ca_bundle_path: ?[]const u8,
+    connect_host: ?[]const u8,
     session_id: ?[]u8 = null,
     pending_hello_ack: ?[]u8 = null,
     pending_chunk_ack: ?ChunkAck = null,
@@ -35,6 +39,8 @@ pub const Connection = struct {
         io: std.Io,
         url: []const u8,
         token: []const u8,
+        ca_bundle_path: ?[]const u8,
+        connect_host: ?[]const u8,
     ) !Connection {
         const uri = try std.Uri.parse(url);
         if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) {
@@ -45,6 +51,8 @@ pub const Connection = struct {
             .io = io,
             .base_url = url,
             .token = token,
+            .ca_bundle_path = ca_bundle_path,
+            .connect_host = connect_host,
         };
     }
 
@@ -181,6 +189,7 @@ pub const Connection = struct {
 
         var client: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
+        try tls.configureClient(&client, self.allocator, self.io, self.ca_bundle_path);
         const uri = try std.Uri.parse(url);
         const authorization = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.token});
         defer self.allocator.free(authorization);
@@ -192,11 +201,17 @@ pub const Connection = struct {
             extra_headers_slice = &extra_headers;
         }
 
+        const override_connection = try connect_override.acquire(&client, uri, self.connect_host);
+        var override_owned = override_connection != null;
+        defer if (override_owned) connect_override.releaseIfUnowned(&client, self.io, override_connection);
+
         var req = try client.request(method, uri, .{
             .redirect_behavior = .unhandled,
+            .connection = override_connection,
             .headers = .{ .authorization = .{ .override = authorization } },
             .extra_headers = extra_headers_slice,
         });
+        override_owned = false;
         defer req.deinit();
 
         if (method.requestHasBody()) {

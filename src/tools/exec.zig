@@ -11,7 +11,9 @@ pub const output_limit_bytes: usize = 4 * 1024 * 1024;
 pub const reader_drain_timeout_ms: u64 = 2_000;
 pub const cancel_poll_interval_ms: u64 = 100;
 
-pub const shell_name = switch (builtin.os.tag) {
+pub const shell_name = if (builtin.os.tag == .linux and builtin.abi == .android)
+    "/system/bin/sh"
+else switch (builtin.os.tag) {
     .windows => "powershell.exe",
     .linux => "/bin/bash",
     else => "/bin/sh",
@@ -127,7 +129,7 @@ fn runShell(
             break :blk try runProcess(
                 allocator,
                 io,
-                &.{ "/bin/bash", "-c", command_writer.written() },
+                &.{ shell_name, "-c", command_writer.written() },
                 input,
                 cancellation,
             );

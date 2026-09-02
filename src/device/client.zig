@@ -53,6 +53,8 @@ const Config = struct {
     token: []const u8,
     device_name: []const u8,
     transport_kind: transport.Kind,
+    ca_bundle_path: ?[]const u8,
+    connect_host: ?[]const u8,
 
     fn load(environ_map: anytype) !Config {
         const gateway_url = environ_map.get("ZSHELL_GATEWAY_URL") orelse return error.MissingGatewayURL;
@@ -70,6 +72,8 @@ const Config = struct {
             .token = token,
             .device_name = device_name,
             .transport_kind = transport_kind,
+            .ca_bundle_path = environ_map.get("ZSHELL_CA_BUNDLE"),
+            .connect_host = environ_map.get("ZSHELL_GATEWAY_CONNECT_HOST"),
         };
     }
 };
@@ -107,6 +111,7 @@ pub fn run(
     while (!shouldStop(io)) {
         connectAndServe(allocator, io, config) catch |err| {
             if (shouldStop(io)) return;
+            std.log.warn("gateway disconnected: {s}", .{@errorName(err)});
             events.record(
                 io,
                 .system,
@@ -126,7 +131,7 @@ fn connectAndServe(
     io: std.Io,
     config: Config,
 ) !void {
-    var connection = try transport.DeviceTransport.connect(allocator, io, config.gateway_url, config.token);
+    var connection = try transport.DeviceTransport.connect(allocator, io, config.gateway_url, config.token, config.ca_bundle_path, config.connect_host);
     defer connection.deinit();
     if (!setActiveConnection(io, &connection)) return error.StopRequested;
     defer clearActiveConnection(io, &connection);
@@ -150,6 +155,9 @@ fn connectAndServe(
         }
         return error.GatewayRejected;
     }
+
+    std.log.info("gateway connected", .{});
+    events.record(io, .system, "shellcore.gateway_connected", .shellcore, null, "connected");
 
     events.record(
         io,

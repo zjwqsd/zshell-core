@@ -31,6 +31,9 @@ pub const Spawned = struct {
 };
 
 pub fn defaultShell(environ_map: *const std.process.Environ.Map) []const u8 {
+    if (builtin.os.tag == .linux and builtin.abi == .android) {
+        return environ_map.get("SHELL") orelse "/system/bin/sh";
+    }
     return switch (builtin.os.tag) {
         .linux => environ_map.get("SHELL") orelse "/bin/bash",
         .windows => "powershell.exe",

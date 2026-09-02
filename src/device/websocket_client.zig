@@ -1,4 +1,6 @@
 const std = @import("std");
+const tls = @import("tls.zig");
+const connect_override = @import("connect_override.zig");
 
 const max_message_size: usize = 8 * 1024 * 1024;
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -15,6 +17,8 @@ pub const Connection = struct {
         io: std.Io,
         url: []const u8,
         token: []const u8,
+        ca_bundle_path: ?[]const u8,
+        connect_host: ?[]const u8,
     ) !Connection {
         const uri = try std.Uri.parse(url);
         if (!std.mem.eql(u8, uri.scheme, "ws") and !std.mem.eql(u8, uri.scheme, "wss")) {
@@ -25,6 +29,7 @@ pub const Connection = struct {
         errdefer allocator.destroy(client);
         client.* = .{ .allocator = allocator, .io = io };
         errdefer client.deinit();
+        try tls.configureClient(client, allocator, io, ca_bundle_path);
 
         var key_source: [16]u8 = undefined;
         io.random(&key_source);
@@ -39,14 +44,20 @@ pub const Connection = struct {
             .{ .name = "sec-websocket-key", .value = &key },
         };
 
+        const override_connection = try connect_override.acquire(client, uri, connect_host);
+        var override_owned = override_connection != null;
+        defer if (override_owned) connect_override.releaseIfUnowned(client, io, override_connection);
+
         var request = try client.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
+            .connection = override_connection,
             .headers = .{
                 .authorization = .{ .override = authorization },
                 .connection = .{ .override = "Upgrade" },
             },
             .extra_headers = &extra_headers,
         });
+        override_owned = false;
         var request_detached = false;
         defer if (!request_detached) request.deinit();
 

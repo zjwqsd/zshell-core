@@ -28,6 +28,16 @@ ZSHELL_DEVICE_TOKEN=<same 24-512 character device secret as gateway>
 ZSHELL_DEVICE_NAME=<unique name chosen for this Core instance>
 ```
 
+Optional:
+
+```text
+ZSHELL_CA_BUNDLE=/absolute/path/to/ca-bundle.pem
+ZSHELL_GATEWAY_CONNECT_HOST=203.0.113.10
+```
+
+`ZSHELL_CA_BUNDLE` replaces the default trust source with an explicit PEM bundle. `ZSHELL_GATEWAY_CONNECT_HOST` changes only the physical TCP destination; the hostname from `ZSHELL_GATEWAY_URL` is still used for TLS SNI, certificate verification, HTTP Host, and connection identity. This is useful when a platform-native resolver performs DNS bootstrap before starting ShellCore.
+
+
 Transport selection is determined only by the URL scheme:
 
 ```text
@@ -68,6 +78,15 @@ zig build test
 
 Use `-Doptimize=ReleaseSafe` instead when you prefer additional runtime safety checks over minimum binary size.
 
+Android targets can be cross-compiled directly:
+
+```bash
+zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseSafe
+zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseSafe
+```
+
+The Android build uses `/system/bin/sh` as its default shell and embeds a Mozilla CA root bundle for environments where the standard Zig system-root discovery is unavailable. An explicit `ZSHELL_CA_BUNDLE` still takes precedence.
+
 ## Run
 
 Linux:
@@ -89,6 +108,14 @@ $env:ZSHELL_DEVICE_NAME = "windows-laptop"
 ```
 
 If the gateway is unavailable, ShellCore remains running and retries every two seconds.
+
+For service-style environments, `--headless` skips the local TUI and runs only the Gateway connection and execution subsystems. On Linux, `--daemon` may be combined with `--headless` to fork, create a new session, and detach from the launching shell:
+
+```bash
+./zig-out/bin/zshell-core --headless --daemon
+```
+
+`--daemon` requires `--headless` and is intentionally unsupported on Windows. The Android launcher uses this mode so the core survives the Wireless ADB shell session that started it.
 
 ## Optional browser capability
 

@@ -37,10 +37,12 @@ pub const DeviceTransport = union(Kind) {
         io: std.Io,
         url: []const u8,
         token: []const u8,
+        ca_bundle_path: ?[]const u8,
+        connect_host: ?[]const u8,
     ) !DeviceTransport {
         return switch (try kindForURL(url)) {
-            .websocket => .{ .websocket = try websocket.Connection.connect(allocator, io, url, token) },
-            .http => .{ .http = try http.Connection.connect(allocator, io, url, token) },
+            .websocket => .{ .websocket = try websocket.Connection.connect(allocator, io, url, token, ca_bundle_path, connect_host) },
+            .http => .{ .http = try http.Connection.connect(allocator, io, url, token, ca_bundle_path, connect_host) },
         };
     }
 
