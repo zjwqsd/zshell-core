@@ -14,7 +14,7 @@ pub const cancel_poll_interval_ms: u64 = 100;
 pub const shell_name = if (builtin.os.tag == .linux and builtin.abi == .android)
     "/system/bin/sh"
 else switch (builtin.os.tag) {
-    .windows => "powershell.exe",
+    .windows => "pwsh.exe",
     .linux => "/bin/bash",
     else => "/bin/sh",
 };
@@ -91,8 +91,7 @@ fn runShell(
 ) !Result {
     return switch (builtin.os.tag) {
         .windows => blk: {
-            // PowerShell 5.1 does not reliably emit UTF-8 when stdout/stderr
-            // are pipes, while the device protocol boundary requires UTF-8 text.
+            // Normalize PowerShell output to UTF-8 at the device protocol boundary.
             var command_writer: std.Io.Writer.Allocating = .init(allocator);
             defer command_writer.deinit();
 
@@ -108,6 +107,14 @@ fn runShell(
             break :blk try runProcess(
                 allocator,
                 io,
+                &.{
+                    "pwsh.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    command_writer.written(),
+                },
                 &.{
                     "powershell.exe",
                     "-NoLogo",
@@ -130,6 +137,7 @@ fn runShell(
                 allocator,
                 io,
                 &.{ shell_name, "-c", command_writer.written() },
+                null,
                 input,
                 cancellation,
             );
@@ -144,6 +152,7 @@ fn runShell(
                 allocator,
                 io,
                 &.{ "/bin/sh", "-c", command_writer.written() },
+                null,
                 input,
                 cancellation,
             );
@@ -155,6 +164,7 @@ fn runProcess(
     allocator: std.mem.Allocator,
     io: std.Io,
     argv: []const []const u8,
+    fallback_argv: ?[]const []const u8,
     input: Input,
     cancellation: ?Cancellation,
 ) !Result {
@@ -165,7 +175,13 @@ fn runProcess(
         .stderr = .pipe,
     };
     if (input.cwd) |cwd| spawn_options.cwd = .{ .path = cwd };
-    var child = try session_process.spawnManaged(allocator, io, spawn_options);
+    var child = session_process.spawnManaged(allocator, io, spawn_options) catch |err| switch (err) {
+        error.FileNotFound => if (fallback_argv) |fallback| blk: {
+            spawn_options.argv = fallback;
+            break :blk try session_process.spawnManaged(allocator, io, spawn_options);
+        } else return err,
+        else => return err,
+    };
 
     // After spawn, every error path must terminate the child.
     var child_finished = false;

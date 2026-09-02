@@ -36,7 +36,7 @@ pub fn defaultShell(environ_map: *const std.process.Environ.Map) []const u8 {
     }
     return switch (builtin.os.tag) {
         .linux => environ_map.get("SHELL") orelse "/bin/bash",
-        .windows => "powershell.exe",
+        .windows => "pwsh.exe",
         else => "/bin/sh",
     };
 }

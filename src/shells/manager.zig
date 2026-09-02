@@ -216,10 +216,6 @@ pub const Manager = struct {
         const selected_shell = input.shell orelse terminal.defaultShell(&self.child_environ);
         if (selected_shell.len == 0) return error.EmptyShell;
 
-        const shell_name = try self.allocator.dupe(u8, selected_shell);
-        var shell_name_owned = true;
-        errdefer if (shell_name_owned) self.allocator.free(shell_name);
-
         const args = try dupeArgs(self.allocator, input.args);
         var args_owned = true;
         errdefer if (args_owned) freeArgs(self.allocator, args);
@@ -236,13 +232,29 @@ pub const Manager = struct {
         var stderr_owned = true;
         errdefer if (stderr_owned) stderr.deinit(self.allocator);
 
-        var spawned = try terminal.spawn(self.allocator, self.io, &self.child_environ, .{
+        var actual_shell = selected_shell;
+        var spawned = terminal.spawn(self.allocator, self.io, &self.child_environ, .{
             .program = selected_shell,
             .args = input.args,
             .cwd = input.cwd,
             .cols = input.cols,
             .rows = input.rows,
-        });
+        }) catch |err| blk: {
+            if (builtin.os.tag != .windows or input.shell != null or !std.mem.eql(u8, selected_shell, "pwsh.exe")) return err;
+            actual_shell = "powershell.exe";
+            break :blk try terminal.spawn(self.allocator, self.io, &self.child_environ, .{
+                .program = actual_shell,
+                .args = input.args,
+                .cwd = input.cwd,
+                .cols = input.cols,
+                .rows = input.rows,
+            });
+        };
+
+        const shell_name = try self.allocator.dupe(u8, actual_shell);
+        var shell_name_owned = true;
+        errdefer if (shell_name_owned) self.allocator.free(shell_name);
+
         var child_owned = true;
         var input_owned = true;
         var output_owned = true;

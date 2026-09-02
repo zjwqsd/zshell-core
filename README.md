@@ -107,6 +107,8 @@ $env:ZSHELL_DEVICE_NAME = "windows-laptop"
 .\zig-out\bin\zshell-core.exe
 ```
 
+On Windows, command execution and the default ConPTY shell prefer PowerShell 7 (`pwsh.exe`). If PowerShell 7 is not installed or cannot be started, zshell falls back to Windows PowerShell 5.1 (`powershell.exe`). Explicitly requested shells are never rewritten.
+
 If the gateway is unavailable, ShellCore remains running and retries every two seconds.
 
 For service-style environments, `--headless` skips the local TUI and runs only the Gateway connection and execution subsystems. On Linux, `--daemon` may be combined with `--headless` to fork, create a new session, and detach from the launching shell:
