@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const backend_name = switch (builtin.os.tag) {
-    .linux => "pty",
+    .linux, .macos => "pty",
     .windows => "conpty",
     else => "unsupported",
 };
@@ -36,6 +36,7 @@ pub fn defaultShell(environ_map: *const std.process.Environ.Map) []const u8 {
     }
     return switch (builtin.os.tag) {
         .linux => environ_map.get("SHELL") orelse "/bin/bash",
+        .macos => environ_map.get("SHELL") orelse "/bin/zsh",
         .windows => "pwsh.exe",
         else => "/bin/sh",
     };
@@ -51,6 +52,7 @@ pub fn spawn(
     if (input.cols == 0 or input.rows == 0) return error.InvalidTerminalSize;
     return switch (builtin.os.tag) {
         .linux => spawnLinux(allocator, io, environ_map, input),
+        .macos => spawnMacos(allocator, io, environ_map, input),
         .windows => spawnWindows(allocator, environ_map, input),
         else => error.UnsupportedPlatform,
     };
@@ -60,6 +62,7 @@ pub fn resize(input: std.Io.File, platform: PlatformHandle, cols: u16, rows: u16
     if (cols == 0 or rows == 0) return error.InvalidTerminalSize;
     switch (builtin.os.tag) {
         .linux => try resizeLinux(input.handle, cols, rows),
+        .macos => try resizeMacos(input.handle, cols, rows),
         .windows => try resizeWindows(platform, cols, rows),
         else => return error.UnsupportedPlatform,
     }
@@ -90,7 +93,7 @@ fn spawnLinux(
 ) !Spawned {
     const linux = std.os.linux;
 
-    const executable = try resolveLinuxExecutable(allocator, io, environ_map, input.program);
+    const executable = try resolvePosixExecutable(allocator, io, environ_map, input.program);
     defer allocator.free(executable);
 
     const argv = try buildPosixArgv(allocator, input.program, input.args);
@@ -244,7 +247,7 @@ fn linuxClose(fd: std.os.linux.fd_t) void {
     _ = std.os.linux.close(fd);
 }
 
-fn resolveLinuxExecutable(
+fn resolvePosixExecutable(
     allocator: std.mem.Allocator,
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
@@ -283,6 +286,99 @@ fn resolveLinuxExecutable(
         if (ok) return candidate;
     }
     return error.FileNotFound;
+}
+
+const Macos = if (builtin.os.tag == .macos) struct {
+    // forkpty(3) creates the master/slave PTY pair, makes the child a session
+    // leader with the slave as its controlling terminal, and connects fd 0/1/2.
+    extern "c" fn forkpty(
+        amaster: *c_int,
+        name: ?[*]u8,
+        termp: ?*const anyopaque,
+        winp: ?*const std.posix.winsize,
+    ) c_int;
+    extern "c" fn dup(fd: c_int) c_int;
+    extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn chdir(path: [*:0]const u8) c_int;
+    extern "c" fn execve(
+        path: [*:0]const u8,
+        argv: [*:null]const ?[*:0]const u8,
+        envp: [*:null]const ?[*:0]const u8,
+    ) c_int;
+    extern "c" fn ioctl(fd: c_int, request: c_ulong, arg: *anyopaque) c_int;
+    extern "c" fn _exit(status: c_int) noreturn;
+
+    // Darwin: _IOW('t', 103, struct winsize).
+    const TIOCSWINSZ: c_ulong = 0x80087467;
+} else struct {};
+
+fn spawnMacos(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    input: SpawnInput,
+) !Spawned {
+    const executable = try resolvePosixExecutable(allocator, io, environ_map, input.program);
+    defer allocator.free(executable);
+
+    const argv = try buildPosixArgv(allocator, input.program, input.args);
+    defer freePosixArgv(allocator, argv);
+
+    var env_block = try environ_map.createPosixBlock(allocator, .{});
+    defer env_block.deinit(allocator);
+
+    const cwd_z = if (input.cwd) |cwd| try allocator.dupeZ(u8, cwd) else null;
+    defer if (cwd_z) |cwd| allocator.free(cwd);
+
+    var size: std.posix.winsize = .{
+        .row = input.rows,
+        .col = input.cols,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    var master: c_int = -1;
+    const fork_result = Macos.forkpty(&master, null, null, &size);
+    if (fork_result < 0) return error.TerminalSpawnFailed;
+
+    if (fork_result == 0) {
+        if (cwd_z) |cwd| {
+            if (Macos.chdir(cwd.ptr) != 0) Macos._exit(126);
+        }
+        _ = Macos.execve(executable.ptr, argv.ptr, env_block.slice.ptr);
+        Macos._exit(127);
+    }
+
+    errdefer _ = Macos.close(master);
+    const input_fd = Macos.dup(master);
+    if (input_fd < 0) return error.SystemResources;
+    errdefer _ = Macos.close(input_fd);
+
+    const pid: std.posix.pid_t = @intCast(fork_result);
+    return .{
+        .child = .{
+            .id = pid,
+            .thread_handle = {},
+            .stdin = null,
+            .stdout = null,
+            .stderr = null,
+            .request_resource_usage_statistics = false,
+        },
+        .input = .{ .handle = input_fd, .flags = .{ .nonblocking = false } },
+        .output = .{ .handle = master, .flags = .{ .nonblocking = false } },
+        .platform = {},
+    };
+}
+
+fn resizeMacos(fd: std.Io.File.Handle, cols: u16, rows: u16) !void {
+    var size: std.posix.winsize = .{
+        .row = rows,
+        .col = cols,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    if (Macos.ioctl(fd, Macos.TIOCSWINSZ, @ptrCast(&size)) != 0) {
+        return error.TerminalIoctlFailed;
+    }
 }
 
 fn buildPosixArgv(

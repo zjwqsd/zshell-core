@@ -144,21 +144,36 @@ fn parseStartupOptions(init: std.process.Init) !StartupOptions {
     return options;
 }
 
+const MacosDaemon = if (builtin.os.tag == .macos) struct {
+    extern "c" fn fork() c_int;
+    extern "c" fn setsid() c_int;
+    extern "c" fn _exit(status: c_int) noreturn;
+} else struct {};
+
 fn daemonize() !void {
-    if (comptime builtin.os.tag != .linux) return error.DaemonUnsupported;
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            const fork_rc = linux.fork();
+            switch (linux.errno(fork_rc)) {
+                .SUCCESS => {},
+                .AGAIN, .NOMEM => return error.DaemonForkFailed,
+                else => return error.DaemonForkFailed,
+            }
 
-    const linux = std.os.linux;
-    const fork_rc = linux.fork();
-    switch (linux.errno(fork_rc)) {
-        .SUCCESS => {},
-        .AGAIN, .NOMEM => return error.DaemonForkFailed,
-        else => return error.DaemonForkFailed,
+            if (fork_rc != 0) linux.exit_group(0);
+
+            const sid_rc = linux.setsid();
+            if (linux.errno(sid_rc) != .SUCCESS) return error.DaemonSetSidFailed;
+        },
+        .macos => {
+            const fork_rc = MacosDaemon.fork();
+            if (fork_rc < 0) return error.DaemonForkFailed;
+            if (fork_rc != 0) MacosDaemon._exit(0);
+            if (MacosDaemon.setsid() < 0) return error.DaemonSetSidFailed;
+        },
+        else => return error.DaemonUnsupported,
     }
-
-    if (fork_rc != 0) linux.exit_group(0);
-
-    const sid_rc = linux.setsid();
-    if (linux.errno(sid_rc) != .SUCCESS) return error.DaemonSetSidFailed;
 }
 
 fn eventLog(

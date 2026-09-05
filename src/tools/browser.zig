@@ -733,6 +733,22 @@ fn discoverBrowserExecutable(
         return null;
     }
 
+    if (builtin.os.tag == .macos) {
+        const system_candidates = [_][]const u8{
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        };
+        for (system_candidates) |candidate| {
+            if (pathExists(io, candidate)) return @as(?[]u8, try allocator.dupe(u8, candidate));
+        }
+
+        if (environ_map.get("HOME")) |home| {
+            if (try candidateUnder(allocator, io, home, &.{ "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome" })) |path| return path;
+            if (try candidateUnder(allocator, io, home, &.{ "Applications", "Chromium.app", "Contents", "MacOS", "Chromium" })) |path| return path;
+        }
+        return null;
+    }
+
     if (builtin.os.tag != .windows) return null;
 
     if (environ_map.get("PROGRAMFILES")) |base| {

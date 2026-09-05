@@ -26,6 +26,11 @@ pub fn spawnManaged(
     io: std.Io,
     options: std.process.SpawnOptions,
 ) !std.process.Child {
+    if (builtin.os.tag == .macos) {
+        var macos_options = options;
+        macos_options.pgid = 0;
+        return std.process.spawn(io, macos_options);
+    }
     if (builtin.os.tag != .linux) return std.process.spawn(io, options);
 
     if (builtin.is_test) {

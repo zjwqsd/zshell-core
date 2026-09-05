@@ -8,7 +8,7 @@ ShellCore contains the operating-system execution capabilities and connects outb
 
 - execute short-lived commands
 - manage direct-process background jobs
-- manage interactive terminal sessions (PTY on Linux, ConPTY on Windows)
+- manage interactive terminal sessions (PTY on Linux/macOS, ConPTY on Windows)
 - read/write files
 - stream files between ShellCore devices through Gateway
 - report environment information
@@ -78,6 +78,18 @@ zig build test
 
 Use `-Doptimize=ReleaseSafe` instead when you prefer additional runtime safety checks over minimum binary size.
 
+macOS targets can be built natively or cross-compiled from another host:
+
+```bash
+# Apple Silicon
+zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSmall
+
+# Intel Mac
+zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSmall
+```
+
+macOS uses `/bin/zsh` for command execution, `$SHELL` (falling back to `/bin/zsh`) for interactive PTY sessions, and the system certificate store for TLS. Both Apple Silicon and Intel targets are supported.
+
 Android targets can be cross-compiled directly:
 
 ```bash
@@ -98,6 +110,15 @@ export ZSHELL_DEVICE_NAME='4090-server'
 ./zig-out/bin/zshell-core
 ```
 
+macOS:
+
+```bash
+export ZSHELL_GATEWAY_URL='wss://zshell.example.com/device/ws'
+export ZSHELL_DEVICE_TOKEN='replace-with-a-long-secret'
+export ZSHELL_DEVICE_NAME='macbook'
+./zig-out/bin/zshell-core
+```
+
 PowerShell:
 
 ```powershell
@@ -111,7 +132,7 @@ On Windows, command execution and the default ConPTY shell prefer PowerShell 7 (
 
 If the gateway is unavailable, ShellCore remains running and retries every two seconds.
 
-For service-style environments, `--headless` skips the local TUI and runs only the Gateway connection and execution subsystems. On Linux, `--daemon` may be combined with `--headless` to fork, create a new session, and detach from the launching shell:
+For service-style environments, `--headless` skips the local TUI and runs only the Gateway connection and execution subsystems. On Linux and macOS, `--daemon` may be combined with `--headless` to fork, create a new session, and detach from the launching shell:
 
 ```bash
 ./zig-out/bin/zshell-core --headless --daemon
@@ -137,6 +158,8 @@ When `--browser` is used, ShellCore performs startup preflight before connecting
 
 - `agent-browser` on `PATH`, or configured with `ZSHELL_AGENT_BROWSER_EXECUTABLE`
 - Google Chrome/Chromium, or configured with `ZSHELL_BROWSER_EXECUTABLE`
+
+On macOS, the standard `/Applications/Google Chrome.app` and `/Applications/Chromium.app` locations (plus their per-user `~/Applications` equivalents) are discovered automatically.
 
 If either dependency is missing, ShellCore exits instead of starting with a partially working browser subsystem. Without `--browser`, `browser_status` reports `enabled=false` and every other `browser_*` operation returns `BrowserFeatureDisabled`.
 

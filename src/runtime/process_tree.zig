@@ -15,7 +15,7 @@ pub fn terminate(child: *std.process.Child, io: std.Io) void {
 
     switch (builtin.os.tag) {
         .windows => terminateWindowsTree(child, io),
-        .linux => terminateLinuxGroup(child, io),
+        .linux, .macos => terminatePosixGroup(child, io),
         else => child.kill(io),
     }
 }
@@ -48,10 +48,10 @@ fn terminateWindowsTree(child: *std.process.Child, io: std.Io) void {
     child.kill(io);
 }
 
-fn terminateLinuxGroup(child: *std.process.Child, io: std.Io) void {
+fn terminatePosixGroup(child: *std.process.Child, io: std.Io) void {
     const pid = child.id orelse return;
 
-    // Managed Linux children are launched in a dedicated process group whose
+    // Managed POSIX children are launched in a dedicated process group whose
     // group ID equals the child PID. A negative PID addresses that whole group.
     std.posix.kill(-pid, .KILL) catch {};
 

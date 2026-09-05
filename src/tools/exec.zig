@@ -16,6 +16,7 @@ pub const shell_name = if (builtin.os.tag == .linux and builtin.abi == .android)
 else switch (builtin.os.tag) {
     .windows => "pwsh.exe",
     .linux => "/bin/bash",
+    .macos => "/bin/zsh",
     else => "/bin/sh",
 };
 
@@ -127,7 +128,7 @@ fn runShell(
                 cancellation,
             );
         },
-        .linux => blk: {
+        .linux, .macos => blk: {
             var command_writer: std.Io.Writer.Allocating = .init(allocator);
             defer command_writer.deinit();
             try command_writer.writer.writeAll(secrets.posix_clear);
@@ -670,6 +671,21 @@ test "timeout preserves earlier stdout" {
             "before-timeout",
         ) != null,
     );
+}
+
+test "macos exec uses zsh" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const result = try run(
+        allocator,
+        std.testing.io,
+        .{ .command = "printf '%s\\n' {alpha,beta}" },
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("alpha\nbeta\n", result.stdout);
+    try std.testing.expect(result.succeeded());
 }
 
 test "linux exec supports bash syntax" {

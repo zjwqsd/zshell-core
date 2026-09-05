@@ -178,7 +178,7 @@ pub const Manager = struct {
         var child_environ = try environ_map.clone(allocator);
         errdefer child_environ.deinit();
         scrubChildEnvironment(&child_environ);
-        if (builtin.os.tag == .linux and child_environ.get("TERM") == null) {
+        if ((builtin.os.tag == .linux or builtin.os.tag == .macos) and child_environ.get("TERM") == null) {
             try child_environ.put("TERM", "xterm-256color");
         }
         return .{
@@ -556,7 +556,7 @@ fn runWorker(context: WorkerContext) !void {
             }
         }
 
-        if (builtin.os.tag == .linux) {
+        if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
             multi_reader.fill(1, poll_timeout) catch |err| switch (err) {
                 error.EndOfStream => {
                     // File-level PTY EIO is retained by MultiReader and handled
@@ -579,7 +579,7 @@ fn runWorker(context: WorkerContext) !void {
         }
     }
 
-    if (builtin.os.tag == .linux) {
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
         multi_reader.checkAnyError() catch |err| switch (err) {
             error.InputOutput => {},
             else => return err,
@@ -730,22 +730,24 @@ fn terminationFromTerm(term: std.process.Child.Term) []const u8 {
 }
 
 test "PTY shell is interactive persistent and resizable" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     try environment.put("PATH", "/usr/local/bin:/usr/bin:/bin");
     try environment.put("HOME", "/tmp");
-    try environment.put("SHELL", "/bin/bash");
+    const test_shell = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+    const test_args: []const []const u8 = if (builtin.os.tag == .macos) &.{"-f"} else &.{ "--noprofile", "--norc" };
+    try environment.put("SHELL", test_shell);
     try environment.put("TERM", "xterm-256color");
 
     var manager = try Manager.init(allocator, std.testing.io, &environment);
     defer manager.deinit();
 
     const started = try manager.start(.{
-        .shell = "/bin/bash",
-        .args = &.{ "--noprofile", "--norc" },
+        .shell = test_shell,
+        .args = test_args,
         .cols = 80,
         .rows = 24,
     });
@@ -779,8 +781,9 @@ test "PTY shell is interactive persistent and resizable" {
 }
 
 test "PTY can start zsh explicitly" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    std.Io.Dir.accessAbsolute(std.testing.io, "/usr/bin/zsh", .{ .execute = true }) catch return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const zsh_path = if (builtin.os.tag == .macos) "/bin/zsh" else "/usr/bin/zsh";
+    std.Io.Dir.accessAbsolute(std.testing.io, zsh_path, .{ .execute = true }) catch return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     var environment = std.process.Environ.Map.init(allocator);
@@ -794,10 +797,10 @@ test "PTY can start zsh explicitly" {
     defer manager.deinit();
 
     const started = try manager.start(.{
-        .shell = "/usr/bin/zsh",
+        .shell = zsh_path,
         .args = &.{"-f"},
     });
-    try std.testing.expectEqualStrings("/usr/bin/zsh", started.shell);
+    try std.testing.expectEqualStrings(zsh_path, started.shell);
     _ = try manager.write(started.shell_id, "printf '__ZSH_%s__\\n' \"$ZSH_VERSION\"", true);
     _ = try manager.write(started.shell_id, "exit", true);
 

@@ -579,7 +579,7 @@ fn terminationFromTerm(term: std.process.Child.Term) []const u8 {
 }
 
 test "direct process job preserves argv boundaries" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     var environ = std.process.Environ.Map.init(allocator);
