@@ -20,14 +20,23 @@ const ResourceKind = enum {
     shell,
 };
 
+const ResourceView = enum {
+    exec,
+    job,
+    shell,
+};
+
 const ResourceRef = struct {
     kind: ResourceKind,
     id: u64,
+    stoppable: bool = false,
+    attachable: bool = false,
 };
 
 const Model = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    view: ResourceView = .exec,
     selected: usize = 0,
     selected_ref: ?ResourceRef = null,
     visible_count: usize = 0,
@@ -66,11 +75,7 @@ const Model = struct {
 
     fn handleKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         if (self.filtering) {
-            if (key.matches(vaxis.Key.escape, .{})) {
-                self.filtering = false;
-                return ctx.consumeAndRedraw();
-            }
-            if (key.matches(vaxis.Key.enter, .{})) {
+            if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
                 self.filtering = false;
                 return ctx.consumeAndRedraw();
             }
@@ -103,15 +108,37 @@ const Model = struct {
                 return ctx.consumeAndRedraw();
             }
         }
+
+        if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+            self.cycleView(true);
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            self.cycleView(false);
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches('e', .{})) {
+            self.switchView(.exec);
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches('j', .{})) {
+            self.switchView(.job);
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches('s', .{})) {
+            self.switchView(.shell);
+            return ctx.consumeAndRedraw();
+        }
+
         if (key.matches('/', .{})) {
             self.filtering = true;
             return ctx.consumeAndRedraw();
         }
-        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{})) {
             if (self.visible_count > 0 and self.selected + 1 < self.visible_count) self.selected += 1;
             return ctx.consumeAndRedraw();
         }
-        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{})) {
             if (self.selected > 0) self.selected -= 1;
             return ctx.consumeAndRedraw();
         }
@@ -136,23 +163,56 @@ const Model = struct {
             try self.stopSelected();
             return ctx.consumeAndRedraw();
         }
-        if (key.matches('a', .{})) {
-            const owner = control.snapshot(self.io).owner;
-            if (owner != .human) {
-                self.setStatus("Press t to take Human Control before attach");
-                return ctx.consumeAndRedraw();
-            }
-            if (self.selected_ref) |selected| {
-                if (selected.kind == .shell) {
-                    self.attach_request = selected.id;
-                    events.record(self.io, .human, "shell.attach_requested", .shell, selected.id, "local TUI attach");
-                    ctx.quit = true;
-                    return;
-                }
-            }
-            self.setStatus("Attach is available for a Shell row");
+        if (self.view == .shell and key.matches('a', .{})) {
+            try self.attachSelected(ctx);
             return ctx.consumeAndRedraw();
         }
+    }
+
+    fn switchView(self: *Model, view: ResourceView) void {
+        if (self.view == view) return;
+        self.view = view;
+        self.selected = 0;
+        self.selected_ref = null;
+        self.visible_count = 0;
+        self.detail_open = false;
+        self.filtering = false;
+        self.filter_len = 0;
+        self.status_len = 0;
+    }
+
+    fn cycleView(self: *Model, backwards: bool) void {
+        const next: ResourceView = if (backwards)
+            switch (self.view) {
+                .exec => .shell,
+                .job => .exec,
+                .shell => .job,
+            }
+        else switch (self.view) {
+            .exec => .job,
+            .job => .shell,
+            .shell => .exec,
+        };
+        self.switchView(next);
+    }
+
+    fn attachSelected(self: *Model, ctx: *vxfw.EventContext) !void {
+        if (control.snapshot(self.io).owner != .human) {
+            self.setStatus("Press t to take Human Control before attach");
+            return;
+        }
+        const selected = self.selected_ref orelse {
+            self.setStatus("No shell selected");
+            return;
+        };
+        if (selected.kind != .shell) return;
+        if (!selected.attachable) {
+            self.setStatus("Selected shell is not running");
+            return;
+        }
+        self.attach_request = selected.id;
+        events.record(self.io, .human, "shell.attach_requested", .shell, selected.id, "local TUI attach");
+        ctx.quit = true;
     }
 
     fn stopSelected(self: *Model) !void {
@@ -164,6 +224,10 @@ const Model = struct {
             self.setStatus("Nothing selected");
             return;
         };
+        if (!selected.stoppable) {
+            self.setStatus("Selected item is not running");
+            return;
+        }
         switch (selected.kind) {
             .exec_active => {
                 executions.requestTerminate(self.io, selected.id, .human) catch |err| {
@@ -230,14 +294,22 @@ const Model = struct {
             .{ .bold = true, .fg = .{ .index = 3 } }
         else
             .{ .bold = true, .fg = .{ .index = 2 } };
+
         putText(ctx, surface, 0, 1, "zshell-core", .{ .bold = true, .fg = .{ .index = 6 } }, size.width -| 2);
         const owner_text = try std.fmt.allocPrint(ctx.arena, "CONTROL: {s}", .{owner.name()});
         const owner_col: u16 = if (size.width > owner_text.len + 2) @intCast(size.width - owner_text.len - 1) else 1;
         putText(ctx, surface, 0, owner_col, owner_text, owner_style, size.width -| owner_col);
-        putText(ctx, surface, 1, 1, "j/k move  Enter detail  t control  x stop  a attach  / filter  q quit", .{ .dim = true }, size.width -| 2);
-        drawRule(surface, 2, size.width);
 
-        if (size.height <= 5) return surface;
+        self.drawTabs(ctx, surface, 1, size.width);
+        const hint = switch (self.view) {
+            .exec => "↑/↓ move  Enter detail  x stop  / filter  t control  Tab switch  q quit",
+            .job => "↑/↓ move  Enter detail  x stop  / filter  t control  Tab switch  q quit",
+            .shell => "↑/↓ move  Enter detail  a attach  x kill  / filter  t control  Tab switch  q quit",
+        };
+        putText(ctx, surface, 2, 1, hint, .{ .dim = true }, size.width -| 2);
+        drawRule(surface, 3, size.width);
+
+        if (size.height <= 6) return surface;
         const footer_row = size.height - 1;
         drawRule(surface, footer_row - 1, size.width);
         if (self.filtering) {
@@ -249,12 +321,12 @@ const Model = struct {
         } else if (self.status_len != 0) {
             putText(ctx, surface, footer_row, 1, self.status[0..self.status_len], .{ .fg = .{ .index = 3 } }, size.width -| 2);
         } else if (owner == .human) {
-            putText(ctx, surface, footer_row, 1, "Agent mutations pause while Human Control is active", .{ .dim = true }, size.width -| 2);
+            putText(ctx, surface, footer_row, 1, "Human Control active — agent mutations are paused", .{ .dim = true }, size.width -| 2);
         } else {
             putText(ctx, surface, footer_row, 1, "Agent control active", .{ .dim = true }, size.width -| 2);
         }
 
-        const content_top: u16 = 3;
+        const content_top: u16 = 4;
         const content_bottom: u16 = footer_row - 1;
         if (self.detail_open) {
             try self.drawDetail(ctx, surface, content_top, 1, content_bottom - content_top, size.width -| 2);
@@ -262,11 +334,11 @@ const Model = struct {
         }
 
         const wide = size.width >= 100;
-        const left_width: u16 = if (wide) @intCast((@as(u32, size.width) * 58) / 100) else size.width;
+        const left_width: u16 = if (wide) @intCast((@as(u32, size.width) * 60) / 100) else size.width;
         const right_col: u16 = if (wide) left_width + 1 else 0;
         if (wide) drawVerticalRule(surface, content_top, content_bottom, left_width);
 
-        try self.drawDashboard(ctx, surface, content_top, 1, content_bottom - content_top, left_width -| 2);
+        try self.drawResourceList(ctx, surface, content_top, 1, content_bottom - content_top, left_width -| 2);
         if (wide) {
             const right_width = size.width -| right_col -| 1;
             const total_height = content_bottom - content_top;
@@ -281,86 +353,127 @@ const Model = struct {
         return surface;
     }
 
-    fn drawDashboard(self: *Model, ctx: vxfw.DrawContext, surface: vxfw.Surface, top: u16, col: u16, height: u16, width: u16) !void {
+    fn drawTabs(self: *const Model, ctx: vxfw.DrawContext, surface: vxfw.Surface, row: u16, width: u16) void {
+        if (width <= 2) return;
+        var col: u16 = 1;
+        const exec_style: vaxis.Cell.Style = if (self.view == .exec) .{ .reverse = true, .bold = true } else .{ .dim = true };
+        const job_style: vaxis.Cell.Style = if (self.view == .job) .{ .reverse = true, .bold = true } else .{ .dim = true };
+        const shell_style: vaxis.Cell.Style = if (self.view == .shell) .{ .reverse = true, .bold = true } else .{ .dim = true };
+        putText(ctx, surface, row, col, " [e] Exec ", exec_style, width -| col);
+        col +|= 10;
+        putText(ctx, surface, row, col, " [j] Job ", job_style, width -| col);
+        col +|= 9;
+        putText(ctx, surface, row, col, " [s] Shell ", shell_style, width -| col);
+    }
+
+    fn drawResourceList(self: *Model, ctx: vxfw.DrawContext, surface: vxfw.Surface, top: u16, col: u16, height: u16, width: u16) !void {
         var row = top;
         var index: usize = 0;
         var selected_ref: ?ResourceRef = null;
         var last_ref: ?ResourceRef = null;
 
-        const active = try executions.list(ctx.arena, self.io);
-        const history = try executions.historyRecent(ctx.arena, self.io, 16);
-        const job_list = try jobs.list(ctx.arena);
-        const shell_list = try shells.list(ctx.arena);
-        sortJobs(job_list.items);
-        sortShells(shell_list.items);
+        switch (self.view) {
+            .exec => {
+                const active = try executions.list(ctx.arena, self.io);
+                const history = try executions.historyRecent(ctx.arena, self.io, 32);
 
-        if (row < top + height) {
-            putText(ctx, surface, row, col, "EXEC", .{ .bold = true, .fg = .{ .index = 6 } }, width);
-            row += 1;
-        }
-        for (active.items) |item| {
-            if (!self.matchesFilter(item.command)) continue;
-            const ref: ResourceRef = .{ .kind = .exec_active, .id = item.executionId };
-            const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} running   {s}", .{ item.executionId, item.command });
-            if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, .running);
-            if (index == self.selected) selected_ref = ref;
-            last_ref = ref;
-            index += 1;
-            row +|= 1;
-        }
-        var h = history.items.len;
-        while (h > 0) {
-            h -= 1;
-            const item = history.items[h];
-            if (!self.matchesFilter(item.command)) continue;
-            const ref: ResourceRef = .{ .kind = .exec_history, .id = item.executionId };
-            const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} {s:<9} {s}", .{ item.executionId, item.status.name(), item.command });
-            const state: VisualState = if (item.status == .failed or (item.exitCode != null and item.exitCode.? != 0)) .failed else .done;
-            if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, state);
-            if (index == self.selected) selected_ref = ref;
-            last_ref = ref;
-            index += 1;
-            row +|= 1;
-        }
+                if (row < top + height) {
+                    putText(ctx, surface, row, col, "RUNNING", .{ .bold = true, .fg = .{ .index = 6 } }, width);
+                    row += 1;
+                }
+                for (active.items) |item| {
+                    if (!self.matchesFilter(item.command)) continue;
+                    const ref: ResourceRef = .{ .kind = .exec_active, .id = item.executionId, .stoppable = true };
+                    const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} running    {s}", .{ item.executionId, item.command });
+                    if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, .running);
+                    if (index == self.selected) selected_ref = ref;
+                    last_ref = ref;
+                    index += 1;
+                    row +|= 1;
+                }
 
-        if (row < top + height) {
-            putText(ctx, surface, row, col, "JOB", .{ .bold = true, .fg = .{ .index = 6 } }, width);
-            row += 1;
-        }
-        for (job_list.items) |item| {
-            if (!self.matchesFilter(item.program)) continue;
-            const ref: ResourceRef = .{ .kind = .job, .id = item.job_id };
-            const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} {s:<9} {s}", .{ item.job_id, item.status.name(), item.program });
-            const state: VisualState = switch (item.status) {
-                .running => .running,
-                .failed => .failed,
-                else => .done,
-            };
-            if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, state);
-            if (index == self.selected) selected_ref = ref;
-            last_ref = ref;
-            index += 1;
-            row +|= 1;
-        }
-
-        if (row < top + height) {
-            putText(ctx, surface, row, col, "SHELL", .{ .bold = true, .fg = .{ .index = 6 } }, width);
-            row += 1;
-        }
-        for (shell_list.items) |item| {
-            if (!self.matchesFilter(item.shell)) continue;
-            const ref: ResourceRef = .{ .kind = .shell, .id = item.shell_id };
-            const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} {s:<9} {s}  {d}x{d}", .{ item.shell_id, item.status.name(), item.shell, item.cols, item.rows });
-            const state: VisualState = switch (item.status) {
-                .running => .running,
-                .failed => .failed,
-                else => .done,
-            };
-            if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, state);
-            if (index == self.selected) selected_ref = ref;
-            last_ref = ref;
-            index += 1;
-            row +|= 1;
+                if (row < top + height) {
+                    if (row > top) row +|= 1;
+                    if (row < top + height) {
+                        putText(ctx, surface, row, col, "RECENT", .{ .bold = true, .fg = .{ .index = 6 } }, width);
+                        row += 1;
+                    }
+                }
+                var h = history.items.len;
+                while (h > 0) {
+                    h -= 1;
+                    const item = history.items[h];
+                    if (!self.matchesFilter(item.command)) continue;
+                    const ref: ResourceRef = .{ .kind = .exec_history, .id = item.executionId };
+                    const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} {s:<10} {s}", .{ item.executionId, item.status.name(), item.command });
+                    const state: VisualState = if (item.status == .failed or (item.exitCode != null and item.exitCode.? != 0)) .failed else .done;
+                    if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, state);
+                    if (index == self.selected) selected_ref = ref;
+                    last_ref = ref;
+                    index += 1;
+                    row +|= 1;
+                }
+                if (index == 0 and row < top + height) {
+                    putText(ctx, surface, row, col, if (self.filter_len == 0) "No exec history" else "No matching execs", .{ .dim = true }, width);
+                }
+            },
+            .job => {
+                const list = try jobs.list(ctx.arena);
+                sortJobs(list.items);
+                if (row < top + height) {
+                    putText(ctx, surface, row, col, "JOBS", .{ .bold = true, .fg = .{ .index = 6 } }, width);
+                    row += 1;
+                }
+                for (list.items) |item| {
+                    if (!self.matchesFilter(item.program)) continue;
+                    const ref: ResourceRef = .{ .kind = .job, .id = item.job_id, .stoppable = item.status == .running };
+                    const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} {s:<10} {s}", .{ item.job_id, item.status.name(), item.program });
+                    const state: VisualState = switch (item.status) {
+                        .running => .running,
+                        .failed => .failed,
+                        else => .done,
+                    };
+                    if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, state);
+                    if (index == self.selected) selected_ref = ref;
+                    last_ref = ref;
+                    index += 1;
+                    row +|= 1;
+                }
+                if (index == 0 and row < top + height) {
+                    putText(ctx, surface, row, col, if (self.filter_len == 0) "No jobs" else "No matching jobs", .{ .dim = true }, width);
+                }
+            },
+            .shell => {
+                const list = try shells.list(ctx.arena);
+                sortShells(list.items);
+                if (row < top + height) {
+                    putText(ctx, surface, row, col, "SHELLS", .{ .bold = true, .fg = .{ .index = 6 } }, width);
+                    row += 1;
+                }
+                for (list.items) |item| {
+                    if (!self.matchesFilter(item.shell)) continue;
+                    const ref: ResourceRef = .{
+                        .kind = .shell,
+                        .id = item.shell_id,
+                        .stoppable = item.status == .running,
+                        .attachable = item.status == .running,
+                    };
+                    const text = try std.fmt.allocPrint(ctx.arena, "#{d:<4} {s:<10} {s}  {d}x{d}", .{ item.shell_id, item.status.name(), item.shell, item.cols, item.rows });
+                    const state: VisualState = switch (item.status) {
+                        .running => .running,
+                        .failed => .failed,
+                        else => .done,
+                    };
+                    if (row < top + height) drawResource(ctx, surface, row, col, width, text, index == self.selected, state);
+                    if (index == self.selected) selected_ref = ref;
+                    last_ref = ref;
+                    index += 1;
+                    row +|= 1;
+                }
+                if (index == 0 and row < top + height) {
+                    putText(ctx, surface, row, col, if (self.filter_len == 0) "No shells" else "No matching shells", .{ .dim = true }, width);
+                }
+            },
         }
 
         self.visible_count = index;
@@ -384,7 +497,12 @@ const Model = struct {
         };
         var row = top + 1;
         const end = top + height;
-        const header = try std.fmt.allocPrint(ctx.arena, "{s} #{d}", .{ @tagName(selected.kind), selected.id });
+        const kind_label = switch (selected.kind) {
+            .exec_active, .exec_history => "EXEC",
+            .job => "JOB",
+            .shell => "SHELL",
+        };
+        const header = try std.fmt.allocPrint(ctx.arena, "{s} #{d}", .{ kind_label, selected.id });
         putText(ctx, surface, row, col, header, .{ .bold = true }, width);
         row += 1;
 
@@ -392,6 +510,7 @@ const Model = struct {
             .exec_active => {
                 const active = try executions.list(ctx.arena, self.io);
                 for (active.items) |item| if (item.executionId == selected.id) {
+                    row = drawField(ctx, surface, row, col, end, width, "status", "running");
                     row = drawField(ctx, surface, row, col, end, width, "command", item.command);
                     row = drawField(ctx, surface, row, col, end, width, "cwd", item.cwd orelse "-");
                     const cancel = if (item.cancelRequested) item.cancelSource orelse "requested" else "no";
@@ -402,6 +521,7 @@ const Model = struct {
             .exec_history => {
                 const history = try executions.historyRecent(ctx.arena, self.io, executions.history_capacity);
                 for (history.items) |item| if (item.executionId == selected.id) {
+                    row = drawField(ctx, surface, row, col, end, width, "status", item.status.name());
                     row = drawField(ctx, surface, row, col, end, width, "command", item.command);
                     row = drawField(ctx, surface, row, col, end, width, "cwd", item.cwd orelse "-");
                     row = drawField(ctx, surface, row, col, end, width, "termination", item.termination);
@@ -413,6 +533,7 @@ const Model = struct {
                 const list = try jobs.list(ctx.arena);
                 sortJobs(list.items);
                 for (list.items) |item| if (item.job_id == selected.id) {
+                    row = drawField(ctx, surface, row, col, end, width, "status", item.status.name());
                     row = drawField(ctx, surface, row, col, end, width, "program", item.program);
                     row = drawField(ctx, surface, row, col, end, width, "cwd", item.cwd orelse "-");
                     if (row < end) {
@@ -432,6 +553,7 @@ const Model = struct {
                 const list = try shells.list(ctx.arena);
                 sortShells(list.items);
                 for (list.items) |item| if (item.shell_id == selected.id) {
+                    row = drawField(ctx, surface, row, col, end, width, "status", item.status.name());
                     row = drawField(ctx, surface, row, col, end, width, "shell", item.shell);
                     row = drawField(ctx, surface, row, col, end, width, "cwd", item.initial_cwd orelse "-");
                     if (row < end) {

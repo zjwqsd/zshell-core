@@ -30,6 +30,10 @@ pub fn run(
 
     try vx.enterAltScreen(writer);
     try vx.queryTerminal(writer, .fromSeconds(1));
+    const use_signal_resize = !vx.state.in_band_resize;
+    if (use_signal_resize) try loop.installResizeHandler();
+    defer if (use_signal_resize) loop.uninstallResizeHandler();
+
     try writer.writeAll("\x1b[2J\x1b[H");
     try writer.flush();
 

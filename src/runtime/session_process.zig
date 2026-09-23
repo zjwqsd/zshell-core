@@ -39,8 +39,12 @@ pub fn spawnManaged(
         return std.process.spawn(io, test_options);
     }
 
-    const executable = try std.process.executablePathAlloc(io, allocator);
-    defer allocator.free(executable);
+    // Keep managed exec working even if the running ShellCore binary has been
+    // atomically replaced by `zig build`. On Linux, executablePathAlloc() may
+    // resolve /proc/self/exe to a pathname suffixed with " (deleted)", which
+    // cannot be spawned by pathname. /proc/self/exe itself remains an executable
+    // reference to the running image until this process exits.
+    const executable = "/proc/self/exe";
 
     const wrapped_argv = try allocator.alloc([]const u8, options.argv.len + 2);
     defer allocator.free(wrapped_argv);
