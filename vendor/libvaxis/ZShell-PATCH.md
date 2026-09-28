@@ -17,3 +17,6 @@ wakes the input task during shutdown.
 
 A second resize guard in `src/vxfw/App.zig` avoids division by zero when a
 terminal transiently reports zero rows or columns during a resize.
+On Windows, the resize self-pipe is never created. wakeResizePipe therefore keeps
+its POSIX write call inside a compile-time non-Windows branch so Windows builds do
+not instantiate the libc-backed POSIX symbol.

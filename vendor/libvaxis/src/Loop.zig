@@ -181,9 +181,14 @@ pub fn Loop(comptime T: type) type {
         }
 
         fn wakeResizePipe(self: *Self) void {
-            const pipe = self.resize_pipe orelse return;
-            const byte = [_]u8{1};
-            _ = std.posix.system.write(pipe[1], &byte, 1);
+            switch (builtin.os.tag) {
+                .windows => return,
+                else => {
+                    const pipe = self.resize_pipe orelse return;
+                    const byte = [_]u8{1};
+                    _ = std.posix.system.write(pipe[1], &byte, 1);
+                },
+            }
         }
 
         fn closeResizePipe(self: *Self) void {
