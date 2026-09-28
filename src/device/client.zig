@@ -9,6 +9,7 @@ const transport = @import("transport.zig");
 
 const protocol_version: u32 = 3;
 const reconnect_delay_seconds: i64 = 2;
+const max_queued_execs: usize = 128;
 
 var lifecycle_mutex: std.Io.Mutex = .init;
 var stop_requested: bool = false;
@@ -89,6 +90,104 @@ const HelloAck = struct {
     type: []const u8,
     accepted: bool,
     message: ?[]const u8 = null,
+};
+
+const QueuedExec = struct {
+    id: u64,
+    request: []u8,
+};
+
+const ExecQueue = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    writer: *ConnectionWriter,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    items: std.ArrayList(QueuedExec) = .empty,
+    stopping: bool = false,
+    worker: ?std.Thread = null,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, writer: *ConnectionWriter) ExecQueue {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .writer = writer,
+        };
+    }
+
+    fn start(self: *ExecQueue) !void {
+        self.worker = try std.Thread.spawn(.{}, workerMain, .{self});
+    }
+
+    fn deinit(self: *ExecQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = true;
+        self.cond.broadcast(self.io);
+        self.mutex.unlock(self.io);
+
+        if (self.worker) |thread| thread.join();
+
+        for (self.items.items) |item| self.allocator.free(item.request);
+        self.items.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn enqueue(self: *ExecQueue, id: u64, request: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, request);
+        errdefer self.allocator.free(copy);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.stopping) return error.ExecQueueStopping;
+        if (self.items.items.len >= max_queued_execs) return error.ExecQueueFull;
+        try self.items.append(self.allocator, .{ .id = id, .request = copy });
+        self.cond.signal(self.io);
+    }
+
+    fn workerMain(self: *ExecQueue) void {
+        self.runWorker() catch |err| {
+            events.record(self.io, .system, "exec.queue_failed", .shellcore, null, @errorName(err));
+            // Wake the transport reader so connectAndServe can tear down this
+            // connection instead of leaving a dead exec worker hidden behind a
+            // still-connected device entry.
+            self.writer.transport.interrupt();
+        };
+    }
+
+    fn runWorker(self: *ExecQueue) !void {
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            while (self.items.items.len == 0 and !self.stopping) {
+                self.cond.waitUncancelable(self.io, &self.mutex);
+            }
+            if (self.stopping) {
+                self.mutex.unlock(self.io);
+                return;
+            }
+            const item = self.items.orderedRemove(0);
+            self.mutex.unlock(self.io);
+            try self.processItem(item);
+        }
+    }
+
+    fn processItem(self: *ExecQueue, item: QueuedExec) !void {
+        defer self.allocator.free(item.request);
+
+        var response_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer response_writer.deinit();
+        _ = try dispatcher.dispatch(
+            self.allocator,
+            self.io,
+            item.request,
+            &response_writer.writer,
+        );
+        try self.writer.sendResult(
+            self.allocator,
+            item.id,
+            response_writer.written(),
+        );
+    }
 };
 
 pub fn run(
@@ -172,6 +271,10 @@ fn connectAndServe(
     var transfers = transfer.Manager.init(allocator, io, &connection);
     defer transfers.deinit();
 
+    var exec_queue = ExecQueue.init(allocator, io, &connection_writer);
+    try exec_queue.start();
+    defer exec_queue.deinit();
+
     while (true) {
         const frame = try connection.readMessage(allocator);
         defer allocator.free(frame.payload);
@@ -209,6 +312,20 @@ fn connectAndServe(
             .operation = message.operation orelse "",
             .arguments = message.arguments,
         }, .{ .emit_null_optional_fields = false })});
+
+        if (std.mem.eql(u8, message.operation orelse "", "exec")) {
+            exec_queue.enqueue(message.id, request_writer.written()) catch |err| switch (err) {
+                error.ExecQueueFull => {
+                    try connection_writer.sendResult(
+                        allocator,
+                        message.id,
+                        "{\"ok\":false,\"isError\":true,\"error\":{\"code\":\"ExecQueueFull\",\"message\":\"Too many exec requests are queued\"}}",
+                    );
+                },
+                else => return err,
+            };
+            continue;
+        }
 
         var response_writer: std.Io.Writer.Allocating = .init(allocator);
         defer response_writer.deinit();

@@ -2,7 +2,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const WindowsApi = if (builtin.os.tag == .windows) struct {
+    const wait_object_0: std.os.windows.DWORD = 0x00000000;
+    const taskkill_timeout_ms: std.os.windows.DWORD = 2_000;
+
     extern "kernel32" fn GetProcessId(process: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
+    extern "kernel32" fn WaitForSingleObject(
+        handle: std.os.windows.HANDLE,
+        milliseconds: std.os.windows.DWORD,
+    ) callconv(.winapi) std.os.windows.DWORD;
+    extern "kernel32" fn TerminateProcess(
+        process: std.os.windows.HANDLE,
+        exit_code: std.os.windows.UINT,
+    ) callconv(.winapi) std.os.windows.BOOL;
 } else struct {};
 
 /// Terminate a spawned command and the descendants that belong to its managed
@@ -40,6 +51,16 @@ fn terminateWindowsTree(child: *std.process.Child, io: std.Io) void {
             child.kill(io);
             return;
         };
+
+        // taskkill is best-effort process-tree cleanup. Never let a stuck
+        // taskkill.exe turn an exec timeout into a permanently wedged
+        // ShellCore request loop.
+        if (killer.id) |killer_handle| {
+            const wait_result = WindowsApi.WaitForSingleObject(killer_handle, WindowsApi.taskkill_timeout_ms);
+            if (wait_result != WindowsApi.wait_object_0) {
+                _ = WindowsApi.TerminateProcess(killer_handle, 1);
+            }
+        }
         _ = killer.wait(io) catch {};
     }
 
