@@ -12,6 +12,8 @@ const direct_public_chunk_size: usize = 1000;
 const direct_lan_chunk_size: usize = 8 * 1024;
 const direct_window: usize = 256;
 const direct_probe_rounds: usize = 8;
+const direct_probe_wait_rounds: usize = 100;
+const direct_probe_interval_ms: u64 = 50;
 const direct_retransmit_ns: i96 = 150 * std.time.ns_per_ms;
 const direct_stall_ns: i96 = 4 * std.time.ns_per_s;
 const direct_progress_bytes: u64 = 1024 * 1024;
@@ -590,11 +592,39 @@ pub const Manager = struct {
     fn configureDirectTarget(self: *Manager, id_text: []const u8, size: u64) !void {
         const id = try parseTransferId(id_text);
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const state = self.target orelse return error.TransferTargetNotPrepared;
-        if (!std.mem.eql(u8, &state.id, &id)) return error.TransferIdMismatch;
-        if (!state.direct) return error.DirectUnavailable;
+        const state = self.target orelse {
+            self.mutex.unlock(self.io);
+            return error.TransferTargetNotPrepared;
+        };
+        if (!std.mem.eql(u8, &state.id, &id)) {
+            self.mutex.unlock(self.io);
+            return error.TransferIdMismatch;
+        }
+        if (!state.direct) {
+            self.mutex.unlock(self.io);
+            return error.DirectUnavailable;
+        }
         state.expected_size = size;
+        const candidates = state.peer_candidates;
+        self.mutex.unlock(self.io);
+
+        // The initial target probe burst can run before the source has opened
+        // its NAT filter. Once both peers are ready, keep punching from the
+        // target side while the source performs the same negotiation.
+        for (0..direct_probe_wait_rounds) |_| {
+            self.mutex.lockUncancelable(self.io);
+            const current = self.target;
+            const active = if (current) |candidate|
+                candidate.direct and std.mem.eql(u8, &candidate.id, &id)
+            else
+                false;
+            const peer = if (current) |candidate| candidate.direct_peer else null;
+            self.mutex.unlock(self.io);
+
+            if (!active or peer != null) break;
+            self.probeOnce(id, candidates);
+            try self.io.sleep(.fromMilliseconds(direct_probe_interval_ms), .awake);
+        }
     }
 
     fn applyDirectAck(self: *Manager, id_text: []const u8, next_chunk: u64) !void {
@@ -993,7 +1023,7 @@ fn directSourceWorker(state: *SourceState) !void {
 }
 
 fn waitForDirectPeer(state: *SourceState) !std.Io.net.IpAddress {
-    for (0..50) |_| {
+    for (0..direct_probe_wait_rounds) |_| {
         if (state.cancelled.load(.acquire)) return error.DirectCancelled;
         state.manager.mutex.lockUncancelable(state.io);
         const peer = state.direct_peer;
@@ -1001,7 +1031,7 @@ fn waitForDirectPeer(state: *SourceState) !std.Io.net.IpAddress {
         state.manager.mutex.unlock(state.io);
         if (peer) |address| return address;
         state.manager.probeOnce(state.id, candidates);
-        try state.io.sleep(.fromMilliseconds(50), .awake);
+        try state.io.sleep(.fromMilliseconds(direct_probe_interval_ms), .awake);
     }
     return error.DirectUnavailable;
 }

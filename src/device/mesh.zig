@@ -8,6 +8,7 @@ const max_payload: usize = 16 * 1024;
 const header_plain_size: usize = 1 + 16 + 8;
 const max_plain: usize = header_plain_size + max_payload;
 const max_packet: usize = magic.len + Aead.nonce_length + max_plain + Aead.tag_length;
+const stun_keepalive_interval_seconds: usize = 10;
 
 pub const PacketType = enum(u8) {
     probe = 1,
@@ -33,6 +34,7 @@ pub const Manager = struct {
     send_mutex: std.Io.Mutex = .init,
     stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
+    keepalive_thread: ?std.Thread = null,
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, token: []const u8) !*Manager {
         const bind_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
@@ -51,6 +53,12 @@ pub const Manager = struct {
         };
 
         try self.discoverWithDeadline();
+        self.keepalive_thread = try std.Thread.spawn(.{}, keepaliveMain, .{self});
+        errdefer {
+            self.stopped.store(true, .release);
+            if (self.keepalive_thread) |thread| thread.join();
+            self.keepalive_thread = null;
+        }
         self.thread = try std.Thread.spawn(.{}, receiveMain, .{self});
         return self;
     }
@@ -59,6 +67,7 @@ pub const Manager = struct {
         self.stopped.store(true, .release);
         self.socket.close(self.io);
         if (self.thread) |thread| thread.join();
+        if (self.keepalive_thread) |thread| thread.join();
         self.allocator.destroy(self);
     }
 
@@ -215,6 +224,38 @@ pub const Manager = struct {
             },
         }
         return local;
+    }
+
+    fn sendStunKeepalive(self: *Manager) void {
+        const stun_servers = [_]std.Io.net.IpAddress{
+            std.Io.net.IpAddress.parse("162.159.207.0", 3478) catch return,
+            std.Io.net.IpAddress.parse("74.125.250.129", 19302) catch return,
+        };
+
+        var transaction: [12]u8 = undefined;
+        self.io.random(&transaction);
+        var request: [20]u8 = @splat(0);
+        std.mem.writeInt(u16, request[0..2], 0x0001, .big);
+        std.mem.writeInt(u16, request[2..4], 0, .big);
+        std.mem.writeInt(u32, request[4..8], 0x2112A442, .big);
+        @memcpy(request[8..20], &transaction);
+
+        self.send_mutex.lockUncancelable(self.io);
+        defer self.send_mutex.unlock(self.io);
+        for (stun_servers) |server| {
+            self.socket.send(self.io, &server, &request) catch {};
+        }
+    }
+
+    fn keepaliveMain(self: *Manager) void {
+        while (!self.stopped.load(.acquire)) {
+            for (0..stun_keepalive_interval_seconds) |_| {
+                if (self.stopped.load(.acquire)) return;
+                self.io.sleep(.fromSeconds(1), .awake) catch return;
+            }
+            if (self.stopped.load(.acquire)) return;
+            self.sendStunKeepalive();
+        }
     }
 
     fn receiveMain(self: *Manager) void {
