@@ -2,6 +2,8 @@ pub const version = @import("version.zig");
 
 pub const device = struct {
     pub const client = @import("device/client.zig");
+    pub const forward = @import("device/forward.zig");
+    pub const mesh = @import("device/mesh.zig");
     pub const transfer = @import("device/transfer.zig");
     pub const transport = @import("device/transport.zig");
 };

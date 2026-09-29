@@ -1,20 +1,45 @@
 const std = @import("std");
 const transport = @import("transport.zig");
 const control = @import("../control/state.zig");
+const mesh = @import("mesh.zig");
 
 pub const binary_magic = transport.binary_magic;
 pub const binary_header_size = transport.binary_header_size;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+const direct_public_chunk_size: usize = 1000;
+const direct_lan_chunk_size: usize = 8 * 1024;
+const direct_window: usize = 256;
+const direct_probe_rounds: usize = 8;
+const direct_retransmit_ns: i96 = 150 * std.time.ns_per_ms;
+const direct_stall_ns: i96 = 4 * std.time.ns_per_s;
+const direct_progress_bytes: u64 = 1024 * 1024;
+const max_peer_candidates: usize = 4;
+
+const CandidateSet = struct {
+    items: [max_peer_candidates]?std.Io.net.IpAddress = @splat(null),
+    count: usize = 0,
+};
+
 const SourceState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    manager: *Manager,
     transport: *transport.DeviceTransport,
     id: [16]u8,
     id_text: [32]u8,
     path: []u8,
     size: u64,
+    direct: bool = false,
+    peer_candidates: [max_peer_candidates]?std.Io.net.IpAddress = @splat(null),
+    direct_peer: ?std.Io.net.IpAddress = null,
+    chunk_size: usize = direct_public_chunk_size,
+    direct_started_ns: i96 = 0,
+    ack_base: u64 = 0,
+    ack_next: u64 = 0,
+    acked: [direct_window]bool = @splat(false),
+    sent_ns: [direct_window]i96 = @splat(0),
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
@@ -28,11 +53,21 @@ const SourceState = struct {
 const TargetState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    manager: *Manager,
     id: [16]u8,
     id_text: [32]u8,
     final_path: []u8,
     part_path: []u8,
     overwrite: bool,
+    direct: bool = false,
+    direct_mode: bool = false,
+    peer_candidates: [max_peer_candidates]?std.Io.net.IpAddress = @splat(null),
+    direct_peer: ?std.Io.net.IpAddress = null,
+    recv_chunk_size: usize = 0,
+    recv_base: u64 = 0,
+    recv_received: [direct_window]bool = @splat(false),
+    expected_size: u64 = 0,
+    last_ack_sent: u64 = 0,
     file: std.Io.File,
     file_open: bool = true,
     hasher: Sha256 = Sha256.init(.{}),
@@ -57,16 +92,36 @@ pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     transport: *transport.DeviceTransport,
+    mesh_manager: ?*mesh.Manager,
     mutex: std.Io.Mutex = .init,
     source: ?*SourceState = null,
     target: ?*TargetState = null,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, device_transport: *transport.DeviceTransport) Manager {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        device_transport: *transport.DeviceTransport,
+        mesh_manager: ?*mesh.Manager,
+    ) Manager {
         return .{
             .allocator = allocator,
             .io = io,
             .transport = device_transport,
+            .mesh_manager = mesh_manager,
         };
+    }
+
+    pub fn attachMeshHandler(self: *Manager) void {
+        const manager = self.mesh_manager orelse return;
+        manager.setHandler(.{
+            .context = @ptrCast(self),
+            .on_packet = meshPacket,
+        });
+    }
+
+    pub fn detachMeshHandler(self: *Manager) void {
+        const manager = self.mesh_manager orelse return;
+        manager.setHandler(null);
     }
 
     pub fn deinit(self: *Manager) void {
@@ -99,10 +154,17 @@ pub const Manager = struct {
                 type: []const u8,
                 transferId: []const u8,
                 path: []const u8,
+                direct: bool = false,
+                peerCandidate: []const u8 = "",
             };
             const parsed = try std.json.parseFromSlice(Message, self.allocator, bytes, .{ .ignore_unknown_fields = false });
             defer parsed.deinit();
-            self.prepareSource(parsed.value.transferId, parsed.value.path) catch |err| {
+            self.prepareSource(
+                parsed.value.transferId,
+                parsed.value.path,
+                parsed.value.direct,
+                parsed.value.peerCandidate,
+            ) catch |err| {
                 try self.sendFailure(parsed.value.transferId, "source", err);
             };
             return true;
@@ -114,10 +176,18 @@ pub const Manager = struct {
                 transferId: []const u8,
                 path: []const u8,
                 overwrite: bool = false,
+                direct: bool = false,
+                peerCandidate: []const u8 = "",
             };
             const parsed = try std.json.parseFromSlice(Message, self.allocator, bytes, .{ .ignore_unknown_fields = false });
             defer parsed.deinit();
-            self.prepareTarget(parsed.value.transferId, parsed.value.path, parsed.value.overwrite) catch |err| {
+            self.prepareTarget(
+                parsed.value.transferId,
+                parsed.value.path,
+                parsed.value.overwrite,
+                parsed.value.direct,
+                parsed.value.peerCandidate,
+            ) catch |err| {
                 try self.sendFailure(parsed.value.transferId, "target", err);
             };
             return true;
@@ -130,6 +200,30 @@ pub const Manager = struct {
             self.startSource(parsed.value.transferId) catch |err| {
                 try self.sendFailure(parsed.value.transferId, "source", err);
             };
+            return true;
+        }
+
+        if (std.mem.eql(u8, header.value.type, "transfer_direct_config")) {
+            const Message = struct {
+                type: []const u8,
+                transferId: []const u8,
+                size: u64,
+            };
+            const parsed = try std.json.parseFromSlice(Message, self.allocator, bytes, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try self.configureDirectTarget(parsed.value.transferId, parsed.value.size);
+            return true;
+        }
+
+        if (std.mem.eql(u8, header.value.type, "transfer_direct_ack")) {
+            const Message = struct {
+                type: []const u8,
+                transferId: []const u8,
+                nextChunk: u64,
+            };
+            const parsed = try std.json.parseFromSlice(Message, self.allocator, bytes, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try self.applyDirectAck(parsed.value.transferId, parsed.value.nextChunk);
             return true;
         }
 
@@ -179,6 +273,17 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             return false;
         }
+        if (state.direct_mode and sequence == 0) {
+            state.direct_mode = false;
+            state.bytes_written = 0;
+            state.next_sequence = 0;
+            state.recv_chunk_size = 0;
+            state.recv_base = 0;
+            state.recv_received = @splat(false);
+            state.expected_size = 0;
+            state.last_ack_sent = 0;
+            state.hasher = Sha256.init(.{});
+        }
         if (sequence != state.next_sequence) {
             const id_text = state.id_text;
             self.mutex.unlock(self.io);
@@ -202,13 +307,20 @@ pub const Manager = struct {
         return true;
     }
 
-    fn prepareSource(self: *Manager, id_text: []const u8, path: []const u8) !void {
+    fn prepareSource(
+        self: *Manager,
+        id_text: []const u8,
+        path: []const u8,
+        direct: bool,
+        peer_candidate_text: []const u8,
+    ) !void {
         if (path.len == 0) return error.EmptyTransferPath;
         const id = try parseTransferId(id_text);
         try self.reapFinishedSource();
 
         const info = try std.Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = true });
         if (info.kind != .file) return error.TransferSourceNotFile;
+        const peer_candidates = parseCandidateSet(peer_candidate_text);
 
         const state = try self.allocator.create(SourceState);
         errdefer self.allocator.destroy(state);
@@ -217,11 +329,14 @@ pub const Manager = struct {
         state.* = .{
             .allocator = self.allocator,
             .io = self.io,
+            .manager = self,
             .transport = self.transport,
             .id = id,
             .id_text = std.fmt.bytesToHex(id, .lower),
             .path = owned_path,
             .size = info.size,
+            .direct = direct and self.mesh_manager != null and peer_candidates.count != 0,
+            .peer_candidates = peer_candidates.items,
         };
 
         self.mutex.lockUncancelable(self.io);
@@ -233,6 +348,7 @@ pub const Manager = struct {
         self.source = state;
         self.mutex.unlock(self.io);
 
+        if (state.direct) self.probeBurst(state.id, state.peer_candidates);
         try self.sendJson(.{
             .type = "transfer_source_ready",
             .transferId = &state.id_text,
@@ -240,10 +356,18 @@ pub const Manager = struct {
         });
     }
 
-    fn prepareTarget(self: *Manager, id_text: []const u8, path: []const u8, overwrite: bool) !void {
+    fn prepareTarget(
+        self: *Manager,
+        id_text: []const u8,
+        path: []const u8,
+        overwrite: bool,
+        direct: bool,
+        peer_candidate_text: []const u8,
+    ) !void {
         try control.requireAgent(self.io);
         if (path.len == 0) return error.EmptyTransferPath;
         const id = try parseTransferId(id_text);
+        const peer_candidates = parseCandidateSet(peer_candidate_text);
 
         self.mutex.lockUncancelable(self.io);
         const busy = self.target != null;
@@ -276,11 +400,14 @@ pub const Manager = struct {
         state.* = .{
             .allocator = self.allocator,
             .io = self.io,
+            .manager = self,
             .id = id,
             .id_text = std.fmt.bytesToHex(id, .lower),
             .final_path = final_path,
             .part_path = part_path,
             .overwrite = overwrite,
+            .direct = direct and self.mesh_manager != null and peer_candidates.count != 0,
+            .peer_candidates = peer_candidates.items,
             .file = file,
         };
 
@@ -293,6 +420,7 @@ pub const Manager = struct {
         self.target = state;
         self.mutex.unlock(self.io);
 
+        if (state.direct) self.probeBurst(state.id, state.peer_candidates);
         try self.sendJson(.{
             .type = "transfer_target_ready",
             .transferId = &state.id_text,
@@ -338,13 +466,28 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             return error.TransferIdMismatch;
         }
-        if (state.bytes_written != expected_size) {
-            self.mutex.unlock(self.io);
-            return error.TransferSizeMismatch;
-        }
-
         var digest: [Sha256.digest_length]u8 = undefined;
-        state.hasher.final(&digest);
+        if (state.direct_mode) {
+            const info = state.file.stat(self.io) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            if (info.size != expected_size) {
+                self.mutex.unlock(self.io);
+                return error.TransferSizeMismatch;
+            }
+            hashFile(state.file, self.io, expected_size, &digest) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            state.bytes_written = expected_size;
+        } else {
+            if (state.bytes_written != expected_size) {
+                self.mutex.unlock(self.io);
+                return error.TransferSizeMismatch;
+            }
+            state.hasher.final(&digest);
+        }
         const actual_sha = std.fmt.bytesToHex(digest, .lower);
         if (!std.ascii.eqlIgnoreCase(&actual_sha, expected_sha)) {
             self.mutex.unlock(self.io);
@@ -444,6 +587,176 @@ pub const Manager = struct {
         state.deinit();
     }
 
+    fn configureDirectTarget(self: *Manager, id_text: []const u8, size: u64) !void {
+        const id = try parseTransferId(id_text);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.target orelse return error.TransferTargetNotPrepared;
+        if (!std.mem.eql(u8, &state.id, &id)) return error.TransferIdMismatch;
+        if (!state.direct) return error.DirectUnavailable;
+        state.expected_size = size;
+    }
+
+    fn applyDirectAck(self: *Manager, id_text: []const u8, next_chunk: u64) !void {
+        const id = try parseTransferId(id_text);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.source orelse return;
+        if (!state.direct or !std.mem.eql(u8, &state.id, &id)) return;
+        if (next_chunk <= state.ack_base or next_chunk > state.ack_next or
+            next_chunk - state.ack_base > direct_window)
+        {
+            return;
+        }
+        var chunk_index = state.ack_base;
+        while (chunk_index < next_chunk) : (chunk_index += 1) {
+            state.acked[@intCast(chunk_index % direct_window)] = true;
+        }
+    }
+
+    fn probeOnce(self: *Manager, id: [16]u8, candidates: [max_peer_candidates]?std.Io.net.IpAddress) void {
+        const mesh_manager = self.mesh_manager orelse return;
+        for (candidates) |candidate| {
+            const destination = candidate orelse continue;
+            mesh_manager.send(destination, .probe, id, 0, &.{}) catch {};
+        }
+    }
+
+    fn probeBurst(self: *Manager, id: [16]u8, candidates: [max_peer_candidates]?std.Io.net.IpAddress) void {
+        for (0..direct_probe_rounds) |_| self.probeOnce(id, candidates);
+    }
+
+    fn handleMeshPacket(
+        self: *Manager,
+        packet_type: mesh.PacketType,
+        id: [16]u8,
+        sequence: u64,
+        payload: []const u8,
+        from: std.Io.net.IpAddress,
+    ) void {
+        const mesh_manager = self.mesh_manager orelse return;
+        switch (packet_type) {
+            .probe => {
+                var matched = false;
+                self.mutex.lockUncancelable(self.io);
+                if (self.source) |state| {
+                    if (state.direct and std.mem.eql(u8, &state.id, &id)) {
+                        state.direct_peer = preferredPeer(state.direct_peer, from);
+                        matched = true;
+                    }
+                }
+                if (self.target) |state| {
+                    if (state.direct and std.mem.eql(u8, &state.id, &id)) {
+                        state.direct_peer = preferredPeer(state.direct_peer, from);
+                        matched = true;
+                    }
+                }
+                self.mutex.unlock(self.io);
+                if (matched) mesh_manager.send(from, .probe_ack, id, 0, &.{}) catch {};
+            },
+            .probe_ack => {
+                self.mutex.lockUncancelable(self.io);
+                if (self.source) |state| {
+                    if (state.direct and std.mem.eql(u8, &state.id, &id)) state.direct_peer = preferredPeer(state.direct_peer, from);
+                }
+                if (self.target) |state| {
+                    if (state.direct and std.mem.eql(u8, &state.id, &id)) state.direct_peer = preferredPeer(state.direct_peer, from);
+                }
+                self.mutex.unlock(self.io);
+            },
+            .file_ack => {
+                self.mutex.lockUncancelable(self.io);
+                if (self.source) |state| {
+                    if (state.direct and std.mem.eql(u8, &state.id, &id) and
+                        sequence > state.ack_base and sequence <= state.ack_next and
+                        sequence - state.ack_base <= direct_window)
+                    {
+                        var chunk_index = state.ack_base;
+                        while (chunk_index < sequence) : (chunk_index += 1) {
+                            state.acked[@intCast(chunk_index % direct_window)] = true;
+                        }
+                    }
+                }
+                self.mutex.unlock(self.io);
+            },
+            .file_chunk => {
+                if (payload.len == 0 or payload.len > direct_lan_chunk_size) return;
+                var ack_value: ?u64 = null;
+                self.mutex.lockUncancelable(self.io);
+                if (self.target) |state| {
+                    if (state.direct and std.mem.eql(u8, &state.id, &id)) {
+                        if (state.recv_chunk_size == 0) {
+                            if (sequence == 0) {
+                                state.recv_chunk_size = if (payload.len > direct_public_chunk_size)
+                                    direct_lan_chunk_size
+                                else if (payload.len == direct_public_chunk_size)
+                                    direct_public_chunk_size
+                                else
+                                    payload.len;
+                            } else if (payload.len == direct_lan_chunk_size) {
+                                state.recv_chunk_size = direct_lan_chunk_size;
+                            } else if (payload.len == direct_public_chunk_size) {
+                                state.recv_chunk_size = direct_public_chunk_size;
+                            } else {
+                                self.mutex.unlock(self.io);
+                                return;
+                            }
+                        }
+
+                        const chunk_size = state.recv_chunk_size;
+                        if (chunk_size == 0 or sequence % chunk_size != 0) {
+                            self.mutex.unlock(self.io);
+                            return;
+                        }
+                        const chunk_index = sequence / chunk_size;
+                        if (chunk_index < state.recv_base) {
+                            ack_value = state.recv_base;
+                        } else if (chunk_index < state.recv_base + direct_window) {
+                            const index: usize = @intCast(chunk_index % direct_window);
+                            if (!state.recv_received[index]) {
+                                state.file.writePositionalAll(self.io, payload, sequence) catch {
+                                    self.mutex.unlock(self.io);
+                                    return;
+                                };
+                                state.recv_received[index] = true;
+                                state.bytes_written = @max(state.bytes_written, sequence + payload.len);
+                            }
+
+                            while (state.recv_received[@intCast(state.recv_base % direct_window)]) {
+                                state.recv_received[@intCast(state.recv_base % direct_window)] = false;
+                                state.recv_base += 1;
+                            }
+                            const total_chunks = if (state.expected_size == 0 or chunk_size == 0)
+                                @as(u64, 0)
+                            else
+                                (state.expected_size + chunk_size - 1) / chunk_size;
+                            const should_ack = state.recv_base >= state.last_ack_sent + 16 or
+                                (total_chunks != 0 and state.recv_base >= total_chunks);
+                            if (should_ack) {
+                                state.last_ack_sent = state.recv_base;
+                                ack_value = state.recv_base;
+                            }
+                        } else if (state.recv_base > state.last_ack_sent) {
+                            state.last_ack_sent = state.recv_base;
+                            ack_value = state.recv_base;
+                        }
+                        state.direct_mode = true;
+                        state.direct_peer = from;
+                    }
+                }
+                self.mutex.unlock(self.io);
+                if (ack_value) |next_chunk| {
+                    const id_text = std.fmt.bytesToHex(id, .lower);
+                    self.sendJson(.{
+                        .type = "transfer_direct_ack",
+                        .transferId = &id_text,
+                        .nextChunk = next_chunk,
+                    }) catch {};
+                }
+            },
+        }
+    }
+
     fn sendFailure(self: *Manager, id_text: []const u8, role: []const u8, err: anyerror) !void {
         try self.sendJson(.{
             .type = "transfer_failed",
@@ -461,6 +774,18 @@ pub const Manager = struct {
     }
 };
 
+fn meshPacket(
+    context: *anyopaque,
+    packet_type: mesh.PacketType,
+    id: [16]u8,
+    sequence: u64,
+    payload: []const u8,
+    from: std.Io.net.IpAddress,
+) void {
+    const self: *Manager = @ptrCast(@alignCast(context));
+    self.handleMeshPacket(packet_type, id, sequence, payload, from);
+}
+
 fn sourceWorkerMain(state: *SourceState) void {
     sourceWorker(state) catch |err| {
         sendSourceFailure(state, err) catch {};
@@ -469,6 +794,21 @@ fn sourceWorkerMain(state: *SourceState) void {
 }
 
 fn sourceWorker(state: *SourceState) !void {
+    if (state.direct and state.manager.mesh_manager != null) {
+        directSourceWorker(state) catch |err| switch (err) {
+            error.DirectUnavailable, error.DirectStalled => {
+                std.log.info("direct transfer unavailable; using gateway relay", .{});
+                return relaySourceWorker(state);
+            },
+            error.DirectCancelled => return sendSourceCancelled(state),
+            else => return err,
+        };
+        return;
+    }
+    return relaySourceWorker(state);
+}
+
+fn relaySourceWorker(state: *SourceState) !void {
     var file = try std.Io.Dir.cwd().openFile(state.io, state.path, .{
         .mode = .read_only,
         .allow_directory = false,
@@ -519,6 +859,168 @@ fn sourceWorker(state: *SourceState) !void {
     });
 }
 
+fn directSourceWorker(state: *SourceState) !void {
+    var file = try std.Io.Dir.cwd().openFile(state.io, state.path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    });
+    defer file.close(state.io);
+
+    if (state.size == 0) {
+        var digest: [Sha256.digest_length]u8 = undefined;
+        var hasher = Sha256.init(.{});
+        hasher.final(&digest);
+        const digest_hex = std.fmt.bytesToHex(digest, .lower);
+        try sendSourceJson(state, .{
+            .type = "transfer_progress",
+            .transferId = &state.id_text,
+            .size = @as(u64, 0),
+        });
+        try sendSourceJson(state, .{
+            .type = "transfer_source_finish",
+            .transferId = &state.id_text,
+            .size = @as(u64, 0),
+            .sha256 = &digest_hex,
+        });
+        return;
+    }
+
+    const initial_peer = try waitForDirectPeer(state);
+    const lan_path = isPrivateIPv4(initial_peer);
+    const chunk_size: usize = if (lan_path) direct_lan_chunk_size else direct_public_chunk_size;
+    const send_budget: usize = if (lan_path) 1 else direct_window;
+    state.manager.mutex.lockUncancelable(state.io);
+    state.chunk_size = chunk_size;
+    state.direct_started_ns = std.Io.Clock.awake.now(state.io).nanoseconds;
+    state.manager.mutex.unlock(state.io);
+
+    const total_chunks = (state.size + chunk_size - 1) / chunk_size;
+    var last_progress_ns = std.Io.Clock.awake.now(state.io).nanoseconds;
+    var last_reported: u64 = 0;
+    var buffer: [direct_lan_chunk_size]u8 = undefined;
+
+    while (true) {
+        if (state.cancelled.load(.acquire)) {
+            try sendSourceCancelled(state);
+            return;
+        }
+
+        const now_ns = std.Io.Clock.awake.now(state.io).nanoseconds;
+        var to_send: [direct_window]u64 = undefined;
+        var send_count: usize = 0;
+        var current_peer: ?std.Io.net.IpAddress = null;
+        var transferred: u64 = 0;
+        var complete = false;
+        var progressed = false;
+
+        state.manager.mutex.lockUncancelable(state.io);
+        while (state.ack_base < state.ack_next and state.acked[@intCast(state.ack_base % direct_window)]) {
+            state.acked[@intCast(state.ack_base % direct_window)] = false;
+            state.ack_base += 1;
+            progressed = true;
+        }
+        if (progressed) last_progress_ns = now_ns;
+
+        while (state.ack_next < total_chunks and state.ack_next - state.ack_base < direct_window) {
+            const index: usize = @intCast(state.ack_next % direct_window);
+            state.acked[index] = false;
+            state.sent_ns[index] = 0;
+            state.ack_next += 1;
+        }
+
+        var sequence = state.ack_base;
+        while (sequence < state.ack_next) : (sequence += 1) {
+            const index: usize = @intCast(sequence % direct_window);
+            if (!state.acked[index] and
+                (state.sent_ns[index] == 0 or now_ns - state.sent_ns[index] >= direct_retransmit_ns))
+            {
+                if (send_count < send_budget) {
+                    to_send[send_count] = sequence;
+                    send_count += 1;
+                    state.sent_ns[index] = now_ns;
+                }
+                if (send_count >= send_budget) break;
+            }
+        }
+
+        current_peer = state.direct_peer;
+        complete = state.ack_base == total_chunks;
+        transferred = @min(state.size, state.ack_base * chunk_size);
+        state.manager.mutex.unlock(state.io);
+
+        if (transferred == state.size or transferred -| last_reported >= direct_progress_bytes) {
+            try sendSourceJson(state, .{
+                .type = "transfer_progress",
+                .transferId = &state.id_text,
+                .size = transferred,
+            });
+            last_reported = transferred;
+        }
+
+        if (complete) break;
+        if (now_ns - last_progress_ns >= direct_stall_ns) return error.DirectStalled;
+
+        const destination = current_peer orelse return error.DirectUnavailable;
+        for (to_send[0..send_count]) |seq| {
+            const offset = seq * chunk_size;
+            const remaining = state.size - offset;
+            const wanted: usize = @intCast(@min(remaining, chunk_size));
+            const count = try file.readPositionalAll(state.io, buffer[0..wanted], offset);
+            if (count != wanted) return error.TransferSourceChanged;
+            state.manager.mesh_manager.?.send(destination, .file_chunk, state.id, offset, buffer[0..count]) catch {};
+        }
+
+        try state.io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    const final_info = try file.stat(state.io);
+    if (final_info.size != state.size) return error.TransferSourceChanged;
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    try hashFile(file, state.io, state.size, &digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    try sendSourceJson(state, .{
+        .type = "transfer_progress",
+        .transferId = &state.id_text,
+        .size = state.size,
+    });
+    try sendSourceJson(state, .{
+        .type = "transfer_source_finish",
+        .transferId = &state.id_text,
+        .size = state.size,
+        .sha256 = &digest_hex,
+    });
+}
+
+fn waitForDirectPeer(state: *SourceState) !std.Io.net.IpAddress {
+    for (0..50) |_| {
+        if (state.cancelled.load(.acquire)) return error.DirectCancelled;
+        state.manager.mutex.lockUncancelable(state.io);
+        const peer = state.direct_peer;
+        const candidates = state.peer_candidates;
+        state.manager.mutex.unlock(state.io);
+        if (peer) |address| return address;
+        state.manager.probeOnce(state.id, candidates);
+        try state.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.DirectUnavailable;
+}
+
+fn hashFile(file: std.Io.File, io: std.Io, size: u64, digest: *[Sha256.digest_length]u8) !void {
+    var hasher = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        const remaining = size - offset;
+        const wanted: usize = @intCast(@min(remaining, buffer.len));
+        const count = try file.readPositionalAll(io, buffer[0..wanted], offset);
+        if (count != wanted) return error.TransferSourceChanged;
+        hasher.update(buffer[0..count]);
+        offset += count;
+    }
+    hasher.final(digest);
+}
+
 fn sendSourceCancelled(state: *SourceState) !void {
     try sendSourceJson(state, .{
         .type = "transfer_source_cancelled",
@@ -540,6 +1042,38 @@ fn sendSourceJson(state: *SourceState, value: anytype) !void {
     defer payload.deinit();
     try payload.writer.print("{f}", .{std.json.fmt(value, .{})});
     try state.transport.writeText(payload.written());
+}
+
+fn parseCandidateSet(text: []const u8) CandidateSet {
+    var result: CandidateSet = .{};
+    var iterator = std.mem.splitScalar(u8, text, ';');
+    while (iterator.next()) |item| {
+        if (result.count >= max_peer_candidates) break;
+        const trimmed = std.mem.trim(u8, item, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const address = mesh.Manager.parseCandidate(trimmed) catch continue;
+        result.items[result.count] = address;
+        result.count += 1;
+    }
+    return result;
+}
+
+fn preferredPeer(current: ?std.Io.net.IpAddress, incoming: std.Io.net.IpAddress) std.Io.net.IpAddress {
+    const existing = current orelse return incoming;
+    if (isPrivateIPv4(incoming) and !isPrivateIPv4(existing)) return incoming;
+    return existing;
+}
+
+fn isPrivateIPv4(address: std.Io.net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| blk: {
+            const b = ip4.bytes;
+            break :blk b[0] == 10 or
+                (b[0] == 172 and b[1] >= 16 and b[1] <= 31) or
+                (b[0] == 192 and b[1] == 168);
+        },
+        .ip6 => false,
+    };
 }
 
 pub fn parseTransferId(text: []const u8) ![16]u8 {
@@ -567,4 +1101,14 @@ test "transfer id round trip" {
     const id = try parseTransferId(text);
     const encoded = std.fmt.bytesToHex(id, .lower);
     try std.testing.expectEqualStrings(text, &encoded);
+}
+
+test "candidate set parses multiple endpoints and prefers private IPv4" {
+    const candidates = parseCandidateSet("192.168.50.10:12345;203.0.113.7:54321");
+    try std.testing.expectEqual(@as(usize, 2), candidates.count);
+    const private = candidates.items[0].?;
+    const public = candidates.items[1].?;
+    try std.testing.expect(isPrivateIPv4(private));
+    try std.testing.expect(!isPrivateIPv4(public));
+    try std.testing.expect(isPrivateIPv4(preferredPeer(public, private)));
 }

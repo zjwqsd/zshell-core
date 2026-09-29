@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 
 const dispatcher = @import("../protocol/dispatcher.zig");
 const events = @import("../control/events.zig");
+const forward = @import("forward.zig");
+const mesh = @import("mesh.zig");
 const version = @import("../version.zig");
 const transfer = @import("transfer.zig");
 const transport = @import("transport.zig");
@@ -207,8 +209,14 @@ pub fn run(
         events.record(io, .system, "shellcore.gateway_insecure", .shellcore, null, "unencrypted gateway transport");
     }
 
+    const mesh_manager = mesh.Manager.create(allocator, io, config.token) catch |err| mesh_failed: {
+        std.log.warn("mesh data plane unavailable: {s}", .{@errorName(err)});
+        break :mesh_failed null;
+    };
+    defer if (mesh_manager) |manager| manager.destroy();
+
     while (!shouldStop(io)) {
-        connectAndServe(allocator, io, config) catch |err| {
+        connectAndServe(allocator, io, config, mesh_manager) catch |err| {
             if (shouldStop(io)) return;
             std.log.warn("gateway disconnected: {s}", .{@errorName(err)});
             events.record(
@@ -229,13 +237,14 @@ fn connectAndServe(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: Config,
+    mesh_manager: ?*mesh.Manager,
 ) !void {
     var connection = try transport.DeviceTransport.connect(allocator, io, config.gateway_url, config.token, config.ca_bundle_path, config.connect_host);
     defer connection.deinit();
     if (!setActiveConnection(io, &connection)) return error.StopRequested;
     defer clearActiveConnection(io, &connection);
 
-    try sendHello(allocator, io, &connection, config);
+    try sendHello(allocator, io, &connection, config, mesh_manager);
 
     const ack_message = try connection.readMessage(allocator);
     defer allocator.free(ack_message.payload);
@@ -268,8 +277,12 @@ fn connectAndServe(
     );
 
     var connection_writer = ConnectionWriter{ .transport = &connection };
-    var transfers = transfer.Manager.init(allocator, io, &connection);
+    var transfers = transfer.Manager.init(allocator, io, &connection, mesh_manager);
     defer transfers.deinit();
+    transfers.attachMeshHandler();
+    defer transfers.detachMeshHandler();
+    var forwards = forward.Manager.init(allocator, io, &connection);
+    defer forwards.deinit();
 
     var exec_queue = ExecQueue.init(allocator, io, &connection_writer);
     try exec_queue.start();
@@ -288,6 +301,7 @@ fn connectAndServe(
             continue;
         }
         if (try transfers.handleText(frame.payload)) continue;
+        if (try forwards.handleText(frame.payload)) continue;
 
         const parsed = try std.json.parseFromSlice(
             Incoming,
@@ -376,6 +390,7 @@ fn sendHello(
     io: std.Io,
     connection: *transport.DeviceTransport,
     config: Config,
+    mesh_manager: ?*mesh.Manager,
 ) !void {
     const workspace = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(workspace);
@@ -391,6 +406,7 @@ fn sendHello(
             .os = @tagName(builtin.os.tag),
             .arch = @tagName(builtin.cpu.arch),
             .version = version.value,
+            .meshCandidate = if (mesh_manager) |manager| manager.candidate() else null,
         },
     }, .{})});
     try connection.writeText(payload.written());
