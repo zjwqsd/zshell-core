@@ -120,7 +120,7 @@ pub const Manager = struct {
 
     pub fn attachMeshHandler(self: *Manager) void {
         const manager = self.mesh_manager orelse return;
-        manager.setHandler(.{
+        manager.setHandler(.transfer, .{
             .context = @ptrCast(self),
             .on_packet = meshPacket,
         });
@@ -128,7 +128,7 @@ pub const Manager = struct {
 
     pub fn detachMeshHandler(self: *Manager) void {
         const manager = self.mesh_manager orelse return;
-        manager.setHandler(null);
+        manager.setHandler(.transfer, null);
     }
 
     pub fn deinit(self: *Manager) void {
@@ -726,6 +726,7 @@ pub const Manager = struct {
                 }
                 self.mutex.unlock(self.io);
             },
+            .forward_probe, .forward_probe_ack, .forward_data, .forward_ack => {},
             .file_chunk => {
                 if (payload.len == 0 or payload.len > direct_lan_chunk_size) return;
                 var ack_value: ?u64 = null;

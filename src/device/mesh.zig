@@ -15,7 +15,13 @@ pub const PacketType = enum(u8) {
     probe_ack = 2,
     file_chunk = 3,
     file_ack = 4,
+    forward_probe = 5,
+    forward_probe_ack = 6,
+    forward_data = 7,
+    forward_ack = 8,
 };
+
+pub const HandlerSlot = enum { transfer, forward };
 
 pub const Handler = struct {
     context: *anyopaque,
@@ -30,7 +36,7 @@ pub const Manager = struct {
     candidate_buffer: [192]u8 = undefined,
     candidate_len: usize = 0,
     handler_mutex: std.Io.Mutex = .init,
-    handler: ?Handler = null,
+    handlers: [2]?Handler = .{ null, null },
     send_mutex: std.Io.Mutex = .init,
     stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
@@ -76,9 +82,9 @@ pub const Manager = struct {
         return self.candidate_buffer[0..self.candidate_len];
     }
 
-    pub fn setHandler(self: *Manager, handler: ?Handler) void {
+    pub fn setHandler(self: *Manager, slot: HandlerSlot, handler: ?Handler) void {
         self.handler_mutex.lockUncancelable(self.io);
-        self.handler = handler;
+        self.handlers[@intFromEnum(slot)] = handler;
         self.handler_mutex.unlock(self.io);
     }
 
@@ -292,6 +298,10 @@ pub const Manager = struct {
                 2 => .probe_ack,
                 3 => .file_chunk,
                 4 => .file_ack,
+                5 => .forward_probe,
+                6 => .forward_probe_ack,
+                7 => .forward_data,
+                8 => .forward_ack,
                 else => continue,
             };
             var transfer_id: [16]u8 = undefined;
@@ -300,10 +310,13 @@ pub const Manager = struct {
             const payload = plain[25..cipher.len];
 
             self.handler_mutex.lockUncancelable(self.io);
-            if (self.handler) |handler| {
-                handler.on_packet(handler.context, packet_type, transfer_id, sequence, payload, message.from);
-            }
+            const handlers = self.handlers;
             self.handler_mutex.unlock(self.io);
+            for (handlers) |maybe_handler| {
+                if (maybe_handler) |handler| {
+                    handler.on_packet(handler.context, packet_type, transfer_id, sequence, payload, message.from);
+                }
+            }
         }
     }
 };

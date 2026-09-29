@@ -281,8 +281,10 @@ fn connectAndServe(
     defer transfers.deinit();
     transfers.attachMeshHandler();
     defer transfers.detachMeshHandler();
-    var forwards = forward.Manager.init(allocator, io, &connection);
+    var forwards = forward.Manager.init(allocator, io, &connection, mesh_manager);
     defer forwards.deinit();
+    forwards.attachMeshHandler();
+    defer forwards.detachMeshHandler();
 
     var exec_queue = ExecQueue.init(allocator, io, &connection_writer);
     try exec_queue.start();
@@ -407,6 +409,7 @@ fn sendHello(
             .arch = @tagName(builtin.cpu.arch),
             .version = version.value,
             .meshCandidate = if (mesh_manager) |manager| manager.candidate() else null,
+            .forwardDirect = mesh_manager != null,
         },
     }, .{})});
     try connection.writeText(payload.written());
