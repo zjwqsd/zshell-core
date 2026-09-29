@@ -310,9 +310,8 @@ pub const Manager = struct {
             const payload = plain[25..cipher.len];
 
             self.handler_mutex.lockUncancelable(self.io);
-            const handlers = self.handlers;
-            self.handler_mutex.unlock(self.io);
-            for (handlers) |maybe_handler| {
+            defer self.handler_mutex.unlock(self.io);
+            for (self.handlers) |maybe_handler| {
                 if (maybe_handler) |handler| {
                     handler.on_packet(handler.context, packet_type, transfer_id, sequence, payload, message.from);
                 }
