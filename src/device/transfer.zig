@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const transport = @import("transport.zig");
 const control = @import("../control/state.zig");
 const mesh = @import("mesh.zig");
@@ -11,12 +12,16 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const direct_public_chunk_size: usize = 1000;
 const direct_lan_chunk_size: usize = 8 * 1024;
 const direct_window: usize = 256;
+const direct_ack_every_packets: usize = 16;
+const direct_ack_bitmap_bytes: usize = direct_window / 8;
 const direct_probe_rounds: usize = 8;
 const direct_probe_wait_rounds: usize = 100;
 const direct_probe_interval_ms: u64 = 50;
 const direct_retransmit_ns: i96 = 150 * std.time.ns_per_ms;
 const direct_stall_ns: i96 = 4 * std.time.ns_per_s;
 const direct_progress_bytes: u64 = 1024 * 1024;
+const direct_public_send_budget: usize = 8;
+const direct_public_pacing_ns: i96 = 250 * std.time.ns_per_us;
 const max_peer_candidates: usize = 4;
 
 const CandidateSet = struct {
@@ -69,7 +74,7 @@ const TargetState = struct {
     recv_base: u64 = 0,
     recv_received: [direct_window]bool = @splat(false),
     expected_size: u64 = 0,
-    last_ack_sent: u64 = 0,
+    ack_pending_packets: usize = 0,
     file: std.Io.File,
     file_open: bool = true,
     hasher: Sha256 = Sha256.init(.{}),
@@ -283,7 +288,7 @@ pub const Manager = struct {
             state.recv_base = 0;
             state.recv_received = @splat(false);
             state.expected_size = 0;
-            state.last_ack_sent = 0;
+            state.ack_pending_packets = 0;
             state.hasher = Sha256.init(.{});
         }
         if (sequence != state.next_sequence) {
@@ -697,13 +702,25 @@ pub const Manager = struct {
             .file_ack => {
                 self.mutex.lockUncancelable(self.io);
                 if (self.source) |state| {
-                    if (state.direct and std.mem.eql(u8, &state.id, &id) and
-                        sequence > state.ack_base and sequence <= state.ack_next and
-                        sequence - state.ack_base <= direct_window)
-                    {
-                        var chunk_index = state.ack_base;
-                        while (chunk_index < sequence) : (chunk_index += 1) {
-                            state.acked[@intCast(chunk_index % direct_window)] = true;
+                    if (state.direct and std.mem.eql(u8, &state.id, &id) and sequence <= state.ack_next) {
+                        if (sequence > state.ack_base) {
+                            const cumulative_end = @min(sequence, state.ack_next);
+                            var chunk_index = state.ack_base;
+                            while (chunk_index < cumulative_end) : (chunk_index += 1) {
+                                state.acked[@intCast(chunk_index % direct_window)] = true;
+                            }
+                        }
+
+                        if (payload.len == direct_ack_bitmap_bytes) {
+                            for (0..direct_window) |bit_index| {
+                                const chunk_index = sequence + @as(u64, @intCast(bit_index));
+                                if (chunk_index < state.ack_base or chunk_index >= state.ack_next) continue;
+                                const byte = payload[bit_index / 8];
+                                const mask = @as(u8, 1) << @intCast(bit_index % 8);
+                                if (byte & mask != 0) {
+                                    state.acked[@intCast(chunk_index % direct_window)] = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -712,6 +729,8 @@ pub const Manager = struct {
             .file_chunk => {
                 if (payload.len == 0 or payload.len > direct_lan_chunk_size) return;
                 var ack_value: ?u64 = null;
+                var ack_bitmap: [direct_ack_bitmap_bytes]u8 = @splat(0);
+
                 self.mutex.lockUncancelable(self.io);
                 if (self.target) |state| {
                     if (state.direct and std.mem.eql(u8, &state.id, &id)) {
@@ -738,9 +757,11 @@ pub const Manager = struct {
                             self.mutex.unlock(self.io);
                             return;
                         }
+
                         const chunk_index = sequence / chunk_size;
+                        var should_ack = false;
                         if (chunk_index < state.recv_base) {
-                            ack_value = state.recv_base;
+                            should_ack = true;
                         } else if (chunk_index < state.recv_base + direct_window) {
                             const index: usize = @intCast(chunk_index % direct_window);
                             if (!state.recv_received[index]) {
@@ -750,38 +771,46 @@ pub const Manager = struct {
                                 };
                                 state.recv_received[index] = true;
                                 state.bytes_written = @max(state.bytes_written, sequence + payload.len);
+                                state.ack_pending_packets += 1;
+                            } else {
+                                should_ack = true;
                             }
 
                             while (state.recv_received[@intCast(state.recv_base % direct_window)]) {
                                 state.recv_received[@intCast(state.recv_base % direct_window)] = false;
                                 state.recv_base += 1;
                             }
+
                             const total_chunks = if (state.expected_size == 0 or chunk_size == 0)
                                 @as(u64, 0)
                             else
                                 (state.expected_size + chunk_size - 1) / chunk_size;
-                            const should_ack = state.recv_base >= state.last_ack_sent + 16 or
+                            should_ack = should_ack or
+                                state.ack_pending_packets >= direct_ack_every_packets or
                                 (total_chunks != 0 and state.recv_base >= total_chunks);
-                            if (should_ack) {
-                                state.last_ack_sent = state.recv_base;
-                                ack_value = state.recv_base;
-                            }
-                        } else if (state.recv_base > state.last_ack_sent) {
-                            state.last_ack_sent = state.recv_base;
-                            ack_value = state.recv_base;
+                        } else {
+                            should_ack = true;
                         }
+
+                        if (should_ack) {
+                            state.ack_pending_packets = 0;
+                            ack_value = state.recv_base;
+                            for (0..direct_window) |bit_index| {
+                                const buffered_chunk = state.recv_base + @as(u64, @intCast(bit_index));
+                                if (state.recv_received[@intCast(buffered_chunk % direct_window)]) {
+                                    ack_bitmap[bit_index / 8] |= @as(u8, 1) << @intCast(bit_index % 8);
+                                }
+                            }
+                        }
+
                         state.direct_mode = true;
                         state.direct_peer = from;
                     }
                 }
                 self.mutex.unlock(self.io);
+
                 if (ack_value) |next_chunk| {
-                    const id_text = std.fmt.bytesToHex(id, .lower);
-                    self.sendJson(.{
-                        .type = "transfer_direct_ack",
-                        .transferId = &id_text,
-                        .nextChunk = next_chunk,
-                    }) catch {};
+                    mesh_manager.send(from, .file_ack, id, next_chunk, &ack_bitmap) catch {};
                 }
             },
         }
@@ -918,7 +947,7 @@ fn directSourceWorker(state: *SourceState) !void {
     const initial_peer = try waitForDirectPeer(state);
     const lan_path = isPrivateIPv4(initial_peer);
     const chunk_size: usize = if (lan_path) direct_lan_chunk_size else direct_public_chunk_size;
-    const send_budget: usize = if (lan_path) 1 else direct_window;
+    const send_budget: usize = if (lan_path) 1 else direct_public_send_budget;
     state.manager.mutex.lockUncancelable(state.io);
     state.chunk_size = chunk_size;
     state.direct_started_ns = std.Io.Clock.awake.now(state.io).nanoseconds;
@@ -1000,7 +1029,14 @@ fn directSourceWorker(state: *SourceState) !void {
             state.manager.mesh_manager.?.send(destination, .file_chunk, state.id, offset, buffer[0..count]) catch {};
         }
 
-        try state.io.sleep(.fromMilliseconds(1), .awake);
+        if (!lan_path and send_count > 0 and builtin.os.tag == .windows) {
+            const deadline_ns = now_ns + direct_public_pacing_ns;
+            while (std.Io.Clock.awake.now(state.io).nanoseconds < deadline_ns) {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        } else {
+            try state.io.sleep(.fromMilliseconds(1), .awake);
+        }
     }
 
     const final_info = try file.stat(state.io);
