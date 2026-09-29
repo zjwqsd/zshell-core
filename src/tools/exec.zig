@@ -1,15 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const secrets = @import("../runtime/secrets.zig");
-const process_tree = @import("../runtime/process_tree.zig");
-const session_process = @import("../runtime/session_process.zig");
+const jobs = @import("jobs.zig");
 pub const Source = @import("../runtime/source.zig").Source;
 
 pub const default_timeout_ms: u64 = 60_000;
 pub const max_timeout_ms: u64 = 60 * 60 * 1000;
 pub const output_limit_bytes: usize = 4 * 1024 * 1024;
-pub const reader_drain_timeout_ms: u64 = 2_000;
-pub const cancel_poll_interval_ms: u64 = 100;
+pub const wait_poll_interval_ms: u64 = 20;
 
 pub const shell_name = if (builtin.os.tag == .linux and builtin.abi == .android)
     "/system/bin/sh"
@@ -33,6 +31,7 @@ pub const Result = struct {
     termination: []const u8,
     timed_out: bool,
     termination_source: Source,
+    job_id: ?jobs.JobId = null,
 
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
@@ -40,6 +39,8 @@ pub const Result = struct {
     }
 
     pub fn succeeded(self: Result) bool {
+        // Promotion is a successful exec handoff, not a command failure.
+        if (self.job_id != null) return true;
         if (self.timed_out) return false;
         return (self.exit_code orelse return false) == 0;
     }
@@ -90,12 +91,11 @@ fn runShell(
     input: Input,
     cancellation: ?Cancellation,
 ) !Result {
+    var command_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer command_writer.deinit();
+
     return switch (builtin.os.tag) {
         .windows => blk: {
-            // Normalize PowerShell output to UTF-8 at the device protocol boundary.
-            var command_writer: std.Io.Writer.Allocating = .init(allocator);
-            defer command_writer.deinit();
-
             try command_writer.writer.writeAll(secrets.powershell_clear);
             try command_writer.writer.writeAll(
                 "$__zshell_utf8 = " ++
@@ -104,232 +104,164 @@ fn runShell(
                     "$OutputEncoding = $__zshell_utf8; ",
             );
             try command_writer.writer.writeAll(input.command);
-
-            break :blk try runProcess(
+            const args = &.{
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command_writer.written(),
+            };
+            break :blk runAsTransientJob(
                 allocator,
                 io,
-                &.{
-                    "pwsh.exe",
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    command_writer.written(),
-                },
-                &.{
-                    "powershell.exe",
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    command_writer.written(),
-                },
                 input,
                 cancellation,
+                "pwsh.exe",
+                args,
+                "powershell.exe",
             );
         },
         .linux, .macos => blk: {
-            var command_writer: std.Io.Writer.Allocating = .init(allocator);
-            defer command_writer.deinit();
             try command_writer.writer.writeAll(secrets.posix_clear);
             try command_writer.writer.writeAll(input.command);
-
-            break :blk try runProcess(
+            break :blk runAsTransientJob(
                 allocator,
                 io,
-                &.{ shell_name, "-c", command_writer.written() },
-                null,
                 input,
                 cancellation,
+                shell_name,
+                &.{ "-c", command_writer.written() },
+                null,
             );
         },
         else => blk: {
-            var command_writer: std.Io.Writer.Allocating = .init(allocator);
-            defer command_writer.deinit();
             try command_writer.writer.writeAll(secrets.posix_clear);
             try command_writer.writer.writeAll(input.command);
-
-            break :blk try runProcess(
+            break :blk runAsTransientJob(
                 allocator,
                 io,
-                &.{ "/bin/sh", "-c", command_writer.written() },
-                null,
                 input,
                 cancellation,
+                "/bin/sh",
+                &.{ "-c", command_writer.written() },
+                null,
             );
         },
     };
 }
 
-fn runProcess(
+fn runAsTransientJob(
     allocator: std.mem.Allocator,
     io: std.Io,
-    argv: []const []const u8,
-    fallback_argv: ?[]const []const u8,
     input: Input,
     cancellation: ?Cancellation,
+    program: []const u8,
+    args: []const []const u8,
+    fallback_program: ?[]const u8,
 ) !Result {
-    var spawn_options: std.process.SpawnOptions = .{
-        .argv = argv,
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    };
-    if (input.cwd) |cwd| spawn_options.cwd = .{ .path = cwd };
-    var child = session_process.spawnManaged(allocator, io, spawn_options) catch |err| switch (err) {
-        error.FileNotFound => if (fallback_argv) |fallback| blk: {
-            spawn_options.argv = fallback;
-            break :blk try session_process.spawnManaged(allocator, io, spawn_options);
-        } else return err,
+    const started = jobs.startTransient(.{
+        .program = program,
+        .args = args,
+        .cwd = input.cwd,
+    }, output_limit_bytes) catch |err| switch (err) {
+        error.FileNotFound => if (fallback_program) |fallback|
+            try jobs.startTransient(.{
+                .program = fallback,
+                .args = args,
+                .cwd = input.cwd,
+            }, output_limit_bytes)
+        else
+            return err,
         else => return err,
     };
+    const job_id = started.job_id;
 
-    // After spawn, every error path must terminate the child.
-    var child_finished = false;
-    defer if (!child_finished) process_tree.terminate(&child, io);
+    // Unless promotion succeeds, this request owns the hidden job and must
+    // leave no registry entry or process behind on any error path.
+    var released = false;
+    defer if (!released) cleanupTransient(job_id);
 
-    // Read stdout and stderr together so neither pipe can fill and deadlock the
-    // child while the parent waits on the other stream.
-    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(
-        allocator,
-        io,
-        multi_reader_buffer.toStreams(),
-        &.{ child.stdout.?, child.stderr.? },
-    );
-    defer multi_reader.deinit();
-
-    const stdout_reader = multi_reader.reader(0);
-    const stderr_reader = multi_reader.reader(1);
-
-    // All fills share one command-wide deadline. Reusing the full timeout for
-    // every fill would let a continuously-writing child extend its lifetime.
-    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const began = std.Io.Clock.Timestamp.now(io, .awake);
     const timeout_ns = input.timeoutMs * std.time.ns_per_ms;
-    const poll_ns = cancel_poll_interval_ms * std.time.ns_per_ms;
-    var did_timeout = false;
-    var cancelled_by: ?Source = null;
+    const poll_ns = wait_poll_interval_ms * std.time.ns_per_ms;
 
     while (true) {
-        try checkOutputLimits(stdout_reader, stderr_reader);
+        const status = try jobs.status(job_id);
+        try checkOutputLimits(status);
+
+        if (status.status != .running) {
+            const result = try collectFinished(allocator, job_id, status);
+            try jobs.discardFinished(job_id);
+            released = true;
+            return result;
+        }
 
         if (cancellation) |probe| {
             if (probe.source(io)) |source| {
-                cancelled_by = source;
-                break;
+                const stopped = try jobs.stopBy(job_id, source);
+                const result = try collectFinished(allocator, job_id, stopped);
+                try jobs.discardFinished(job_id);
+                released = true;
+                return result;
             }
         }
 
-        const elapsed_ns = elapsedNanoseconds(started, io);
+        const elapsed_ns = elapsedNanoseconds(began, io);
         if (elapsed_ns >= timeout_ns) {
-            did_timeout = true;
-            break;
-        }
+            try jobs.promote(job_id);
+            released = true;
 
-        const remaining_ns = timeout_ns - elapsed_ns;
-        const fill_ns = @min(remaining_ns, poll_ns);
-        multi_reader.fill(1, relativeTimeout(fill_ns)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            // Short fill timeouts are cancellation polling points. The command
-            // deadline is checked at the top of the next iteration.
-            error.Timeout => continue,
-            else => return err,
-        };
-    }
-
-    try checkOutputLimits(stdout_reader, stderr_reader);
-
-    if (did_timeout or cancelled_by != null) {
-        process_tree.terminate(&child, io);
-        child_finished = true;
-
-        try drainAfterTermination(
-            &multi_reader,
-            stdout_reader,
-            stderr_reader,
-            io,
-        );
-
-        const stdout = try multi_reader.toOwnedSlice(0);
-        errdefer allocator.free(stdout);
-        const stderr = try multi_reader.toOwnedSlice(1);
-        errdefer allocator.free(stderr);
-
-        if (cancelled_by) |source| {
+            const logs = try jobs.logs(allocator, job_id, null, null);
             return .{
-                .stdout = stdout,
-                .stderr = stderr,
+                .stdout = logs.stdout,
+                .stderr = logs.stderr,
                 .exit_code = null,
-                .termination = "killed",
-                .timed_out = false,
-                .termination_source = source,
+                .termination = "promoted_to_job",
+                .timed_out = true,
+                .termination_source = .system,
+                .job_id = job_id,
             };
         }
 
-        return .{
-            .stdout = stdout,
-            .stderr = stderr,
-            .exit_code = null,
-            .termination = "timeout",
-            .timed_out = true,
-            .termination_source = .system,
-        };
+        const remaining_ns = timeout_ns - elapsed_ns;
+        try io.sleep(.fromNanoseconds(@intCast(@min(remaining_ns, poll_ns))), .awake);
     }
+}
 
-    try multi_reader.checkAnyError();
-
-    const stdout = try multi_reader.toOwnedSlice(0);
-    errdefer allocator.free(stdout);
-    const stderr = try multi_reader.toOwnedSlice(1);
-    errdefer allocator.free(stderr);
-
-    const term = try child.wait(io);
-    child_finished = true;
-
+fn collectFinished(
+    allocator: std.mem.Allocator,
+    job_id: jobs.JobId,
+    status: jobs.StatusResult,
+) !Result {
+    const logs = try jobs.logs(allocator, job_id, null, null);
+    const source = status.termination_source orelse .system;
+    const termination = switch (status.status) {
+        .exited => status.termination orelse "exited",
+        .stopped => "killed",
+        .failed => status.worker_error orelse status.termination orelse "worker_error",
+        .running => unreachable,
+    };
     return .{
-        .stdout = stdout,
-        .stderr = stderr,
-        .exit_code = exitCodeFromTerm(term),
-        .termination = terminationFromTerm(term),
+        .stdout = logs.stdout,
+        .stderr = logs.stderr,
+        .exit_code = status.exit_code,
+        .termination = termination,
         .timed_out = false,
-        .termination_source = .process,
+        .termination_source = source,
     };
 }
 
-fn drainAfterTermination(
-    multi_reader: *std.Io.File.MultiReader,
-    stdout_reader: *std.Io.Reader,
-    stderr_reader: *std.Io.Reader,
-    io: std.Io,
-) !void {
-    const started = std.Io.Clock.Timestamp.now(io, .awake);
-    const drain_timeout_ns = reader_drain_timeout_ms * std.time.ns_per_ms;
-
-    while (true) {
-        try checkOutputLimits(stdout_reader, stderr_reader);
-
-        const elapsed_ns = elapsedNanoseconds(started, io);
-        if (elapsed_ns >= drain_timeout_ns) return;
-
-        multi_reader.fill(
-            1,
-            relativeTimeout(drain_timeout_ns - elapsed_ns),
-        ) catch |err| switch (err) {
-            error.EndOfStream, error.Timeout => return,
-            else => return err,
-        };
+fn cleanupTransient(job_id: jobs.JobId) void {
+    const status = jobs.status(job_id) catch return;
+    if (status.status == .running) {
+        _ = jobs.stopBy(job_id, .system) catch return;
     }
+    jobs.discardFinished(job_id) catch {};
 }
 
-fn relativeTimeout(nanoseconds: u64) std.Io.Timeout {
-    const signed: i64 = @intCast(nanoseconds);
-    return .{
-        .duration = .{
-            .raw = .fromNanoseconds(signed),
-            .clock = .awake,
-        },
-    };
+fn checkOutputLimits(status: jobs.StatusResult) !void {
+    if (status.stdout_bytes > output_limit_bytes) return error.StdoutStreamTooLong;
+    if (status.stderr_bytes > output_limit_bytes) return error.StderrStreamTooLong;
 }
 
 fn elapsedNanoseconds(started: std.Io.Clock.Timestamp, io: std.Io) u64 {
@@ -338,35 +270,14 @@ fn elapsedNanoseconds(started: std.Io.Clock.Timestamp, io: std.Io) u64 {
     return @intCast(raw);
 }
 
-fn checkOutputLimits(
-    stdout_reader: *std.Io.Reader,
-    stderr_reader: *std.Io.Reader,
-) !void {
-    if (stdout_reader.buffered().len > output_limit_bytes) {
-        return error.StdoutStreamTooLong;
-    }
-    if (stderr_reader.buffered().len > output_limit_bytes) {
-        return error.StderrStreamTooLong;
-    }
-}
-
-fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {
-    return switch (term) {
-        .exited => |code| code,
-        .signal, .stopped, .unknown => null,
-    };
-}
-
-fn terminationFromTerm(term: std.process.Child.Term) []const u8 {
-    return switch (term) {
-        .exited => "exited",
-        .signal => "signal",
-        .stopped => "stopped",
-        .unknown => "unknown",
-    };
-}
-
 // Tests
+
+fn initTestJobs(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    var environ = std.process.Environ.Map.init(allocator);
+    errdefer environ.deinit();
+    try jobs.init(allocator, std.testing.io, &environ);
+    return environ;
+}
 
 test "validate exec input" {
     try std.testing.expectError(
@@ -402,8 +313,10 @@ test "validate exec input" {
 }
 
 test "exec captures stdout" {
-    const allocator =
-        std.testing.allocator;
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
 
     const command =
         switch (builtin.os.tag) {
@@ -452,8 +365,10 @@ test "exec captures stdout" {
 }
 
 test "exec captures stdout and stderr separately" {
-    const allocator =
-        std.testing.allocator;
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
 
     const command =
         switch (builtin.os.tag) {
@@ -494,8 +409,10 @@ test "exec captures stdout and stderr separately" {
 }
 
 test "nonzero exit code is preserved" {
-    const allocator =
-        std.testing.allocator;
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
 
     const result =
         try run(
@@ -529,8 +446,10 @@ test "nonzero exit code is preserved" {
 }
 
 test "unicode output is UTF-8" {
-    const allocator =
-        std.testing.allocator;
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
 
     const command =
         switch (builtin.os.tag) {
@@ -570,113 +489,98 @@ test "unicode output is UTF-8" {
     );
 }
 
-test "timeout terminates command" {
-    const allocator =
-        std.testing.allocator;
+test "timeout promotes running command to visible job" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
-    const command =
-        switch (builtin.os.tag) {
-            .windows => "Start-Sleep -Seconds 5",
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
 
-            else => "sleep 5",
-        };
+    const began = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    const result = try run(allocator, std.testing.io, .{
+        .command = "printf 'before'; sleep 5",
+        .timeoutMs = 100,
+    });
+    defer result.deinit(allocator);
 
-    const started =
-        std.Io.Clock.Timestamp.now(
-            std.testing.io,
-            .awake,
-        );
+    try std.testing.expect(result.succeeded());
+    try std.testing.expect(result.timed_out);
+    try std.testing.expectEqualStrings("promoted_to_job", result.termination);
+    try std.testing.expect(result.job_id != null);
+    try std.testing.expect(elapsedNanoseconds(began, std.testing.io) < 4 * std.time.ns_per_s);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "before") != null);
 
-    const result =
-        try run(
-            allocator,
-            std.testing.io,
-            .{
-                .command = command,
+    const job_id = result.job_id.?;
+    const list = try jobs.list(allocator);
+    defer list.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqual(job_id, list.items[0].job_id);
 
-                .timeoutMs = 300,
-            },
-        );
-    defer result.deinit(
-        allocator,
-    );
-
-    const elapsed_ns =
-        elapsedNanoseconds(
-            started,
-            std.testing.io,
-        );
-
-    try std.testing.expect(
-        result.timed_out,
-    );
-
-    try std.testing.expect(
-        !result.succeeded(),
-    );
-
-    try std.testing.expectEqual(
-        @as(?u8, null),
-        result.exit_code,
-    );
-
-    try std.testing.expectEqualStrings(
-        "timeout",
-        result.termination,
-    );
-
-    //
-    // Start-Sleep 5 缁夋帪绱濇担鍡楃安鐠囥儲妲戦弰鐐－娴?5 缁夋帞绮ㄩ弶鐔粹偓?    //
-    try std.testing.expect(
-        elapsed_ns <
-            4 * std.time.ns_per_s,
-    );
+    const stopped = try jobs.stop(job_id);
+    try std.testing.expectEqual(jobs.Status.stopped, stopped.status);
 }
 
-test "timeout preserves earlier stdout" {
-    const allocator =
-        std.testing.allocator;
+test "promoted exec continues and retains later output" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
-    const command =
-        switch (builtin.os.tag) {
-            .windows => "Write-Output 'before-timeout'; " ++
-                "Start-Sleep -Seconds 5",
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
 
-            else => "printf 'before-timeout'; " ++
-                "sleep 5",
-        };
+    const result = try run(allocator, std.testing.io, .{
+        .command = "printf 'before-'; sleep 0.2; printf 'after'",
+        .timeoutMs = 50,
+    });
+    defer result.deinit(allocator);
+    const job_id = result.job_id.?;
 
-    const result =
-        try run(
-            allocator,
-            std.testing.io,
-            .{
-                .command = command,
+    var finished = false;
+    for (0..100) |_| {
+        const current = try jobs.status(job_id);
+        if (current.status != .running) {
+            finished = true;
+            break;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(finished);
 
-                .timeoutMs = 500,
-            },
-        );
-    defer result.deinit(
-        allocator,
-    );
+    const logs = try jobs.logs(allocator, job_id, null, null);
+    defer logs.deinit(allocator);
+    try std.testing.expectEqualStrings("before-after", logs.stdout);
+    try std.testing.expectEqualStrings("", logs.stderr);
+}
 
-    try std.testing.expect(
-        result.timed_out,
-    );
+test "short exec leaves no visible or hidden job" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
-    try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            result.stdout,
-            "before-timeout",
-        ) != null,
-    );
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
+
+    const result = try run(allocator, std.testing.io, .{
+        .command = "printf done",
+        .timeoutMs = 1000,
+    });
+    defer result.deinit(allocator);
+    try std.testing.expect(result.job_id == null);
+    try std.testing.expectEqualStrings("done", result.stdout);
+
+    const list = try jobs.list(allocator);
+    defer list.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
 test "macos exec uses zsh" {
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
-    const allocator = std.testing.allocator;
     const result = try run(
         allocator,
         std.testing.io,
@@ -689,9 +593,12 @@ test "macos exec uses zsh" {
 }
 
 test "linux exec supports bash syntax" {
+    const allocator = std.testing.allocator;
+    var environ = try initTestJobs(allocator);
+    defer environ.deinit();
+    defer jobs.deinit();
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    const allocator = std.testing.allocator;
     const result = try run(
         allocator,
         std.testing.io,

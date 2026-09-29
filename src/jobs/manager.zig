@@ -89,6 +89,7 @@ pub const ListResult = struct {
 };
 
 pub const Error = error{JobNotFound};
+pub const DiscardError = Error || error{JobStillRunning};
 
 const Job = struct {
     id: JobId,
@@ -104,6 +105,7 @@ const Job = struct {
     worker_error: ?[]const u8 = null,
     termination_source: ?Source = null,
     stop_requested: ?Source = null,
+    visible: bool = true,
 
     stdout: TailBuffer,
     stderr: TailBuffer,
@@ -171,7 +173,31 @@ pub const Manager = struct {
     }
 
     pub fn start(self: *Manager, input: StartInput) !StartResult {
+        return self.startInternal(input, true, log_buffer_bytes);
+    }
+
+    pub fn startTransient(
+        self: *Manager,
+        input: StartInput,
+        buffer_bytes: usize,
+    ) !StartResult {
+        if (buffer_bytes == 0) return error.InvalidBufferSize;
+        return self.startInternal(input, false, buffer_bytes);
+    }
+
+    fn startInternal(
+        self: *Manager,
+        input: StartInput,
+        visible: bool,
+        buffer_bytes: usize,
+    ) !StartResult {
         if (input.program.len == 0) return error.EmptyProgram;
+
+        // Spawn before publishing the job so a failed executable lookup leaves
+        // no registry entry behind.
+        var child = try spawnDirectProcess(self.allocator, self.io, &self.child_environ, input.program, input.args, input.cwd);
+        var child_owned = true;
+        errdefer if (child_owned) process_tree.terminate(&child, self.io);
 
         // Jobs outlive the request that created them, so request-owned strings
         // are copied into the manager allocator.
@@ -186,10 +212,10 @@ pub const Manager = struct {
             null;
         errdefer if (cwd) |value| self.allocator.free(value);
 
-        var stdout = try TailBuffer.init(self.allocator, log_buffer_bytes);
+        var stdout = try TailBuffer.init(self.allocator, buffer_bytes);
         errdefer stdout.deinit(self.allocator);
 
-        var stderr = try TailBuffer.init(self.allocator, log_buffer_bytes);
+        var stderr = try TailBuffer.init(self.allocator, buffer_bytes);
         errdefer stderr.deinit(self.allocator);
 
         const job = try self.allocator.create(Job);
@@ -206,14 +232,10 @@ pub const Manager = struct {
             .program = program,
             .args = args,
             .cwd = cwd,
+            .visible = visible,
             .stdout = stdout,
             .stderr = stderr,
         };
-
-        // A successful start means the OS process has already been created.
-        var child = try spawnDirectProcess(self.allocator, self.io, &self.child_environ, input.program, input.args, input.cwd);
-        var child_owned = true;
-        errdefer if (child_owned) process_tree.terminate(&child, self.io);
 
         self.mutex.lockUncancelable(self.io);
         self.jobs.put(job_id, job) catch |err| {
@@ -245,8 +267,36 @@ pub const Manager = struct {
         job.thread = thread;
         job.mutex.unlock(job.io);
 
-        events.record(self.io, .agent, "job.started", .job, job_id, input.program);
+        if (visible) events.record(self.io, .agent, "job.started", .job, job_id, input.program);
         return .{ .job_id = job_id, .status = .running };
+    }
+
+    pub fn promote(self: *Manager, job_id: JobId) Error!void {
+        const job = try self.getJob(job_id);
+        job.mutex.lockUncancelable(job.io);
+        const changed = !job.visible;
+        if (changed) job.visible = true;
+        job.mutex.unlock(job.io);
+        if (changed) events.record(self.io, .system, "job.promoted", .job, job_id, job.program);
+    }
+
+    pub fn discardFinished(self: *Manager, job_id: JobId) DiscardError!void {
+        const job = try self.getJob(job_id);
+
+        job.mutex.lockUncancelable(job.io);
+        const running = job.status == .running;
+        job.mutex.unlock(job.io);
+        if (running) return error.JobStillRunning;
+
+        if (claimThread(job)) |thread| thread.join();
+
+        self.mutex.lockUncancelable(self.io);
+        const removed = self.jobs.fetchRemove(job_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.JobNotFound;
+        };
+        self.mutex.unlock(self.io);
+        removed.value.deinit(self.allocator);
     }
 
     pub fn status(self: *Manager, job_id: JobId) Error!StatusResult {
@@ -316,7 +366,17 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const items = try allocator.alloc(ListItem, self.jobs.count());
+        var count: usize = 0;
+        var count_iterator = self.jobs.iterator();
+        while (count_iterator.next()) |entry| {
+            const job = entry.value_ptr.*;
+            job.mutex.lockUncancelable(job.io);
+            const visible = job.visible;
+            job.mutex.unlock(job.io);
+            if (visible) count += 1;
+        }
+
+        const items = try allocator.alloc(ListItem, count);
         errdefer allocator.free(items);
 
         var index: usize = 0;
@@ -324,17 +384,19 @@ pub const Manager = struct {
         while (iterator.next()) |entry| {
             const job = entry.value_ptr.*;
             job.mutex.lockUncancelable(job.io);
-            items[index] = .{
-                .job_id = job.id,
-                .program = job.program,
-                .args = job.args,
-                .cwd = job.cwd,
-                .status = job.status,
-                .exit_code = job.exit_code,
-                .termination_source = job.termination_source,
-            };
+            if (job.visible) {
+                items[index] = .{
+                    .job_id = job.id,
+                    .program = job.program,
+                    .args = job.args,
+                    .cwd = job.cwd,
+                    .status = job.status,
+                    .exit_code = job.exit_code,
+                    .termination_source = job.termination_source,
+                };
+                index += 1;
+            }
             job.mutex.unlock(job.io);
-            index += 1;
         }
 
         return .{ .items = items };
@@ -364,8 +426,9 @@ fn workerMain(context: WorkerContext) void {
         job.worker_error = @errorName(err);
         job.termination = "worker_error";
         job.termination_source = .system;
+        const visible = job.visible;
         job.mutex.unlock(job.io);
-        events.record(job.io, .system, "job.failed", .job, job.id, @errorName(err));
+        if (visible) events.record(job.io, .system, "job.failed", .job, job.id, @errorName(err));
     };
 }
 
@@ -405,7 +468,7 @@ fn runWorker(context: WorkerContext) !void {
             child_active = false;
             drainBuffered(job, stdout_reader, stderr_reader);
             setStopped(job, source);
-            events.record(io, source, "job.stopped", .job, job.id, "stopped");
+            if (isVisible(job)) events.record(io, source, "job.stopped", .job, job.id, "stopped");
             return;
         }
 
@@ -425,7 +488,7 @@ fn runWorker(context: WorkerContext) !void {
     const term = try child.wait(io);
     child_active = false;
     setTerminated(job, term);
-    events.record(io, .process, "job.exited", .job, job.id, terminationFromTerm(term));
+    if (isVisible(job)) events.record(io, .process, "job.exited", .job, job.id, terminationFromTerm(term));
 }
 
 fn drainBuffered(
@@ -445,6 +508,12 @@ fn drainBuffered(
     // The data is now in the bounded tail buffers; release MultiReader's copy.
     stdout_reader.tossBuffered();
     stderr_reader.tossBuffered();
+}
+
+fn isVisible(job: *Job) bool {
+    job.mutex.lockUncancelable(job.io);
+    defer job.mutex.unlock(job.io);
+    return job.visible;
 }
 
 fn stopSource(job: *Job) ?Source {
@@ -608,4 +677,32 @@ test "direct process job preserves argv boundaries" {
     defer logs.deinit(allocator);
     try std.testing.expectEqualStrings("<hello world>", logs.stdout);
     try std.testing.expectEqualStrings("", logs.stderr);
+}
+
+test "transient jobs stay hidden until promoted" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+
+    var manager = try Manager.init(allocator, std.testing.io, &environ);
+    defer manager.deinit();
+
+    const started = try manager.startTransient(.{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "sleep 5" },
+    }, 4096);
+
+    const hidden = try manager.list(allocator);
+    defer hidden.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), hidden.items.len);
+
+    try manager.promote(started.job_id);
+    const visible = try manager.list(allocator);
+    defer visible.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), visible.items.len);
+    try std.testing.expectEqual(started.job_id, visible.items[0].job_id);
+
+    _ = try manager.stop(started.job_id, .agent);
 }

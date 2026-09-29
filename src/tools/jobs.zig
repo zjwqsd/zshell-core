@@ -29,6 +29,18 @@ pub fn start(input: StartInput) !StartResult {
     return getManager().start(input);
 }
 
+pub fn startTransient(input: StartInput, buffer_bytes: usize) !StartResult {
+    return getManager().startTransient(input, buffer_bytes);
+}
+
+pub fn promote(job_id: JobId) manager.Error!void {
+    return getManager().promote(job_id);
+}
+
+pub fn discardFinished(job_id: JobId) manager.DiscardError!void {
+    return getManager().discardFinished(job_id);
+}
+
 pub fn status(job_id: JobId) manager.Error!StatusResult {
     return getManager().status(job_id);
 }

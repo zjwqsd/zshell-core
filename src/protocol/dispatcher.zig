@@ -269,6 +269,8 @@ fn execute(
         .termination = tracked.result.termination,
         .terminationSource = tracked.result.termination_source.name(),
         .timedOut = tracked.result.timed_out,
+        .status = if (tracked.result.job_id != null) "promoted_to_job" else "completed",
+        .jobId = tracked.result.job_id,
         .stdout = .{ .encoding = stdout.encoding, .data = stdout.data },
         .stderr = .{ .encoding = stderr.encoding, .data = stderr.data },
     }, !tracked.result.succeeded());
