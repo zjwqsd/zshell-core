@@ -71,9 +71,9 @@ pub const Manager = struct {
 
     pub fn destroy(self: *Manager) void {
         self.stopped.store(true, .release);
-        self.socket.close(self.io);
         if (self.thread) |thread| thread.join();
         if (self.keepalive_thread) |thread| thread.join();
+        self.socket.close(self.io);
         self.allocator.destroy(self);
     }
 
@@ -132,23 +132,7 @@ pub const Manager = struct {
     }
 
     fn discoverWithDeadline(self: *Manager) !void {
-        var state = DiscoveryState{ .manager = self };
-        const thread = try std.Thread.spawn(.{}, discoveryMain, .{&state});
-        var completed = false;
-        for (0..20) |_| {
-            if (state.done.load(.acquire)) {
-                completed = true;
-                break;
-            }
-            try self.io.sleep(.fromMilliseconds(50), .awake);
-        }
-        if (!completed) {
-            self.socket.close(self.io);
-            thread.join();
-            return error.MeshDiscoveryTimeout;
-        }
-        thread.join();
-        if (!state.ok.load(.acquire)) return error.MeshDiscoveryFailed;
+        try self.discoverPublicCandidate();
     }
 
     fn discoverPublicCandidate(self: *Manager) !void {
@@ -172,7 +156,14 @@ pub const Manager = struct {
         if (!sent) return error.StunSendFailed;
 
         var buffer: [1500]u8 = undefined;
-        const message = try self.socket.receive(self.io, &buffer);
+        const message = self.socket.receiveTimeout(
+            self.io,
+            &buffer,
+            .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } },
+        ) catch |err| switch (err) {
+            error.Timeout => return error.MeshDiscoveryTimeout,
+            else => return err,
+        };
         const bytes = message.data;
         if (bytes.len < 20 or !std.mem.eql(u8, bytes[8..20], &transaction)) return error.InvalidStunResponse;
 
@@ -257,7 +248,7 @@ pub const Manager = struct {
         while (!self.stopped.load(.acquire)) {
             for (0..stun_keepalive_interval_seconds) |_| {
                 if (self.stopped.load(.acquire)) return;
-                self.io.sleep(.fromSeconds(1), .awake) catch return;
+                self.io.sleep(.fromMilliseconds(1000), .awake) catch return;
             }
             if (self.stopped.load(.acquire)) return;
             self.sendStunKeepalive();
@@ -277,7 +268,14 @@ pub const Manager = struct {
         var plain: [max_plain]u8 = undefined;
 
         while (!self.stopped.load(.acquire)) {
-            const message = try self.socket.receive(self.io, &packet_buffer);
+            const message = self.socket.receiveTimeout(
+                self.io,
+                &packet_buffer,
+                .{ .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake } },
+            ) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
             const packet = message.data;
             if (packet.len < magic.len + Aead.nonce_length + Aead.tag_length + header_plain_size) continue;
             if (!std.mem.eql(u8, packet[0..magic.len], magic)) continue;
@@ -320,17 +318,21 @@ pub const Manager = struct {
     }
 };
 
-const DiscoveryState = struct {
-    manager: *Manager,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
+test "mesh receive thread shuts down without cross-thread socket close" {
+    const io = std.testing.io;
+    const bind_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+    const socket = try bind_address.bind(io, .{ .mode = .dgram, .protocol = .udp });
 
-fn discoveryMain(state: *DiscoveryState) void {
-    state.manager.discoverPublicCandidate() catch {
-        state.done.store(true, .release);
-        return;
+    var manager: Manager = .{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .socket = socket,
+        .key = @splat(0),
     };
-    state.ok.store(true, .release);
-    state.done.store(true, .release);
+
+    const thread = try std.Thread.spawn(.{}, Manager.receiveMain, .{&manager});
+    try io.sleep(.fromMilliseconds(20), .awake);
+    manager.stopped.store(true, .release);
+    thread.join();
+    socket.close(io);
 }
