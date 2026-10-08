@@ -16,6 +16,17 @@ const max_queued_execs: usize = 128;
 var lifecycle_mutex: std.Io.Mutex = .init;
 var stop_requested: bool = false;
 var active_connection: ?*transport.DeviceTransport = null;
+var connection_status: []const u8 = "Connecting to gateway";
+pub fn connectionStatus(io: std.Io) []const u8 {
+    lifecycle_mutex.lockUncancelable(io);
+    defer lifecycle_mutex.unlock(io);
+    return connection_status;
+}
+fn setConnectionStatus(io: std.Io, status: []const u8) void {
+    lifecycle_mutex.lockUncancelable(io);
+    defer lifecycle_mutex.unlock(io);
+    connection_status = status;
+}
 
 pub fn requestStop(io: std.Io) void {
     lifecycle_mutex.lockUncancelable(io);
@@ -197,7 +208,10 @@ pub fn run(
     io: std.Io,
     environ_map: anytype,
 ) !void {
-    const config = try Config.load(environ_map);
+    const config = Config.load(environ_map) catch |err| {
+        setConnectionStatus(io, @errorName(err));
+        return err;
+    };
     resetStop(io);
 
     const transport_name = @tagName(config.transport_kind);
@@ -218,6 +232,7 @@ pub fn run(
     while (!shouldStop(io)) {
         connectAndServe(allocator, io, config, mesh_manager) catch |err| {
             if (shouldStop(io)) return;
+            setConnectionStatus(io, "Disconnected - retrying in 2s (see Events)");
             std.log.warn("gateway disconnected: {s}", .{@errorName(err)});
             events.record(
                 io,
@@ -264,6 +279,7 @@ fn connectAndServe(
         return error.GatewayRejected;
     }
 
+    setConnectionStatus(io, if (config.transport_kind == .websocket) "Connected / WebSocket" else "Connected / HTTP");
     std.log.info("gateway connected", .{});
     events.record(io, .system, "shellcore.gateway_connected", .shellcore, null, "connected");
 

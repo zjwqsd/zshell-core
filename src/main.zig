@@ -63,8 +63,10 @@ pub fn main(init: std.process.Init) !void {
 
     zshell.control.events.record(init.io, .system, "shellcore.tui_started", .shellcore, null, "terminal UI started");
 
+    var tui_model: tui.Model = .{ .allocator = init.gpa, .io = init.io };
+    defer tui_model.deinit();
     while (true) {
-        const action = try tui.run(init.gpa, init.io, init.environ_map);
+        const action = try tui.run(init.gpa, init.io, init.environ_map, &tui_model);
         switch (action) {
             .quit => return,
             .attach => |shell_id| {

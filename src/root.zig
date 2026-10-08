@@ -47,3 +47,8 @@ pub const runtime = struct {
     pub const session_process = @import("runtime/session_process.zig");
     pub const terminal = @import("runtime/terminal.zig");
 };
+
+test {
+    _ = @import("tui/app.zig");
+    _ = @import("tui/attach.zig");
+}

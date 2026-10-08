@@ -59,7 +59,7 @@ pub fn run(
         while (try loop.tryEvent()) |event| {
             switch (event) {
                 .key_press => |key| {
-                    if (key.matches(']', .{ .ctrl = true })) return;
+                    if (isDetachKey(key)) return;
                     var encoded_buffer: [64]u8 = undefined;
                     var encoded: std.Io.Writer = .fixed(&encoded_buffer);
                     try encodeKey(&encoded, key);
@@ -172,3 +172,14 @@ const Definition = struct {
     suffix: u8,
     ss3: bool = false,
 };
+
+// Legacy terminals encode Ctrl+] as GS; Kitty encodes it as a modified key.
+fn isDetachKey(key: vaxis.Key) bool {
+    return key.matches(']', .{ .ctrl = true }) or key.matches(0x1d, .{});
+}
+
+test "detach supports legacy and extended terminal key encodings" {
+    try std.testing.expect(isDetachKey(.{ .codepoint = 0x1d }));
+    try std.testing.expect(isDetachKey(.{ .codepoint = ']', .mods = .{ .ctrl = true } }));
+    try std.testing.expect(!isDetachKey(.{ .codepoint = ']' }));
+}

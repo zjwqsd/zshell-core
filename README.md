@@ -185,20 +185,37 @@ The target side is a mutating action and obeys Human Control: a new transfer is 
 
 ShellCore runs a local libvaxis/vxfw terminal UI. It does not open a local HTTP control port. The dashboard shows exec, job and shell activity together with recent events and selected-resource details.
 
+The resource list occupies one third of a wide terminal, with details and output beside it. Narrow terminals use a single pane; Enter opens the selected resource. Connection status and control ownership remain visible at the top. Selection follows resource IDs as executions complete, and list scrolling keeps the selected resource visible. Shell attach/detach preserves the dashboard state.
+
 Keyboard controls:
 
 ```text
-j/k       move selection
-Enter     open/close detail
-/         filter resources
+1 / e     executions
+2         jobs
+3 / s     shells
+4         events
+Shift+Tab next view
+Tab       focus resource list / output
+j/k, ↑/↓  move selection or scroll focused output
+PgUp/PgDn page through the focused pane
+Home      first item / first output line
+End       last item / resume live output
+Enter     expand / close selected resource details
+/         filter resources or search focused output
+Esc       close expanded detail, clear search, or return to list
+o         cycle all / stdout / stderr
+f         pause / resume output following
 t         toggle Agent/Human Control
-x         terminate exec / stop job / kill shell (Human Control)
+x         stop selected running resource (Human Control; y confirms)
 a         attach to a running shell (Human Control)
-q         stop ShellCore
+?         keyboard help
+q, Ctrl+C stop Core and disconnect (y confirms; any other key cancels)
 ```
+
+Output search filters matching lines and accepts UTF-8 text; ASCII matching is case-insensitive. Scrolling up freezes the displayed output so new messages do not move the reading position. End resumes live output. Job output can be viewed by stream; the combined view groups stdout before stderr and does not imply chronological interleaving. Output older than the manager's retained buffer is unavailable and is marked as discarded. Exec history currently retains metadata and exit codes, not command output; use Jobs when output history is needed.
 
 Shell attach connects the local terminal to the existing PTY/ConPTY session. Press `Ctrl+]` to detach and return to the dashboard without killing the shell.
 
-While Human Control is active, mutating agent operations remain blocked by the existing control-state checks. Runtime logs and important lifecycle state are surfaced through the Events view so terminal output does not corrupt the TUI.
+While Human Control is active, new mutating agent operations are blocked by the existing control-state checks; already-running work continues. Runtime logs and important lifecycle state are surfaced through the Events view so terminal output does not corrupt the TUI.
 
 Stopping `zshell-core` closes the device transport; the gateway then removes it from the live registry.
